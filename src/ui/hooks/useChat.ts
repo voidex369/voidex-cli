@@ -32,7 +32,8 @@ let shadowAllowedTools: string[] = [];
 let shadowHistory: string[] = [];
 
 // --- EXTREME MEMORY LIMITS ---
-const MAX_CONTENT_LENGTH = 50000; // 50KB hard-limit for strings in state
+const MAX_CONTENT_LENGTH = 50000;
+const MAX_HISTORY_CHARS = 100000; // [Task A] Hard limit for sliding window (approx tokens)
 
 /**
  * Truncates content aggressively BEFORE it enters the React state/Shadow.
@@ -43,6 +44,30 @@ function truncateForRAM(content: string | null): string | null {
         return content.slice(0, MAX_CONTENT_LENGTH) + "\n\n... [ TRUNCATED AT 50KB FOR EXTREME RAM STABILITY ] ...";
     }
     return content;
+}
+
+// [Task A] Prune history based on total characters (Estimated Token Limit Pruning)
+function pruneHistoryByChars(messages: Message[]): Message[] {
+    let totalChars = 0;
+    const result: Message[] = [];
+
+    // Process from newest to oldest
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        const mChars = (m.content?.length || 0) + (JSON.stringify(m.tool_calls || []).length);
+
+        if (totalChars + mChars > MAX_HISTORY_CHARS) {
+            // Keep at least the first user message (pinned goal) if possible, else break
+            if (m.role === 'user' && i === messages.findIndex(msg => msg.role === 'user')) {
+                result.unshift(m);
+            }
+            break;
+        }
+
+        result.unshift(m);
+        totalChars += mChars;
+    }
+    return result;
 }
 
 
@@ -133,7 +158,8 @@ ${sysContext}
             return;
         }
 
-        let assistantMsg: Message = {
+        // [Task C] Ensure local state scope
+        const assistantMsg: Message = {
             id: 'assistant-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
             role: 'assistant',
             content: '',
@@ -215,8 +241,16 @@ ${sysContext}
                 const toolMessages: Message[] = [];
                 for (const tc of assistantMsg.tool_calls || []) {
                     const toolName = tc.function.name;
-                    let args = {};
-                    try { args = JSON.parse(tc.function.arguments); } catch (e) { }
+
+                    // [Task B] Hardened JSON parsing & validation
+                    let args: any = {};
+                    try {
+                        args = JSON.parse(tc.function.arguments || '{}');
+                    } catch (e) {
+                        const errOutput = `[ERROR] Invalid JSON arguments for tool ${toolName}: ${tc.function.arguments}`;
+                        toolMessages.push({ id: 'tool-err-' + Date.now(), role: 'tool', tool_call_id: tc.id, name: toolName, content: errOutput });
+                        continue;
+                    }
 
                     const needsApproval = ['write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash'].includes(toolName); // [SECURITY FIX]
                     const isWhitelisted = allowedToolsRef.current.includes(toolName);
@@ -250,59 +284,70 @@ ${sysContext}
                     }
 
                     if (proceed) {
-                        setAgentStatus(`Executing ${toolName}...`);
-                        const toolFunc = toolRegistry[toolName as keyof typeof toolRegistry];
-                        if (toolFunc) {
-                            let chunkBuffer = '';
-                            const result = await toolFunc({
-                                ...args,
-                                onOutput: (chunk: string) => {
-                                    chunkBuffer += chunk;
-                                    const now = Date.now();
-                                    const isTTY = process.stdout.isTTY;
-                                    if (isTTY && (now - lastUpdate > UPDATE_INTERVAL)) {
-                                        const pending = chunkBuffer;
-                                        chunkBuffer = '';
-                                        setLiveToolOutput(prev => {
-                                            const next = prev + pending;
-                                            return next.length > 5000 ? next.slice(-5000) : next;
-                                        });
-                                        lastUpdate = now;
-                                    }
+                        try {
+                            setAgentStatus(`Executing ${toolName}...`);
+                            const toolFunc = toolRegistry[toolName as keyof typeof toolRegistry];
+
+                            // [Task B] Pre-execution Validation
+                            if (toolFunc) {
+                                // Basic validation for common tools
+                                if (['read_file', 'write_file', 'replace'].includes(toolName) && typeof args.path !== 'string') {
+                                    throw new Error(`Missing required 'path' argument (string) for ${toolName}`);
                                 }
-                            });
 
-                            // Flush any remaining bit in the buffer
-                            if (chunkBuffer) {
-                                setLiveToolOutput(prev => {
-                                    const next = prev + chunkBuffer;
-                                    return next.length > 5000 ? next.slice(-5000) : next;
+                                let chunkBuffer = '';
+                                const result = await toolFunc({
+                                    ...args,
+                                    onOutput: (chunk: string) => {
+                                        chunkBuffer += chunk;
+                                        const now = Date.now();
+                                        const isTTY = process.stdout.isTTY;
+                                        if (isTTY && (now - lastUpdate > UPDATE_INTERVAL)) {
+                                            const pending = chunkBuffer;
+                                            chunkBuffer = '';
+                                            setLiveToolOutput(prev => {
+                                                const next = prev + pending;
+                                                return next.length > 5000 ? next.slice(-5000) : next;
+                                            });
+                                            lastUpdate = now;
+                                        }
+                                    }
                                 });
+
+                                // Flush any remaining bit in the buffer
+                                if (chunkBuffer) {
+                                    setLiveToolOutput(prev => {
+                                        const next = prev + chunkBuffer;
+                                        return next.length > 5000 ? next.slice(-5000) : next;
+                                    });
+                                }
+
+                                await new Promise(r => setTimeout(r, 800));
+                                setLiveToolOutput('');
+
+                                const safeOutput = truncateForRAM(result.output);
+                                const resMsg: Message = {
+                                    id: 'tool-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+                                    role: 'tool',
+                                    tool_call_id: tc.id,
+                                    name: toolName,
+                                    content: safeOutput
+                                };
+                                toolMessages.push(resMsg);
+                                setMessages(prev => [...prev, resMsg]);
+
+                                if (result.isError) break;
+                            } else {
+                                throw new Error(`Tool ${toolName} not found`);
                             }
-
-                            // Keep output visible for a moment while transition to result analysis
-                            await new Promise(r => setTimeout(r, 800));
-                            setLiveToolOutput('');
-
-                            const safeOutput = truncateForRAM(result.output);
-                            const resMsg: Message = {
-                                id: 'tool-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
-                                role: 'tool',
-                                tool_call_id: tc.id,
-                                name: toolName,
-                                content: safeOutput
-                            };
-                            toolMessages.push(resMsg);
-                            setMessages(prev => [...prev, resMsg]);
-
-                            if (result.isError) break;
-                        } else {
+                        } catch (err: any) {
+                            // [Task B] Graceful catch for tool execution crashes
                             const errorMsg: Message = {
-                                id: 'tool-err-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
+                                id: 'tool-err-' + Date.now(),
                                 role: 'tool',
                                 tool_call_id: tc.id,
                                 name: toolName,
-                                content: `Error: Tool ${toolName} not found`
+                                content: `[TOOL CRASH] ${err.message}`
                             };
                             toolMessages.push(errorMsg);
                             setMessages(prev => [...prev, errorMsg]);
@@ -331,39 +376,39 @@ ${sysContext}
 
                 await new Promise(resolve => setTimeout(resolve, 1000));
 
-                // --- PINNED CONTEXT & SLIDING WINDOW ---
-                // We ALWAYS include the first USER message to keep the original goal in mind.
+                // --- [Task A] SLIDING WINDOW (Character Based) ---
                 const firstUserIdx = nextMessages.findIndex(m => m.role === 'user');
                 const firstUserMsg = firstUserIdx !== -1 ? nextMessages[firstUserIdx] : null;
 
-                const windowSize = 30;
-                // Get the last N messages, but EXCLUDE the first user message if it's already there to avoid double inclusion
-                let recentMessages = nextMessages.slice(-windowSize);
+                // Apply character-based pruning
+                let recentMessages = pruneHistoryByChars(nextMessages);
+
+                // Ensure the pinned goal is ALWAYS present
                 if (firstUserMsg && !recentMessages.find(m => m.id === firstUserMsg.id)) {
-                    // Prepend the pinned goal if it was sliced out
                     recentMessages = [firstUserMsg, ...recentMessages];
                 }
 
                 // ZOMBIE CHECK: If user aborted during tool execution, STOP here.
                 if (!abortController.current) return;
 
-                // DETECT LOGIC LOOPS: (Content + Action check)
+                // [Task D] ADVANCED LOOP DETECTION: (Scan 3-5 deep)
                 const assistants = nextMessages.filter(m => m.role === 'assistant');
-                if (assistants.length >= 2) {
-                    const last = assistants[assistants.length - 1];
-                    const prev = assistants[assistants.length - 2];
-
-                    // Fuzzy comparison: remove emojis, extra whitespace, and lowercase
+                if (assistants.length >= 3) {
                     const clean = (s: string | null) => (s || '').replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '').toLowerCase().trim();
-                    const lastClean = clean(last.content);
-                    const prevClean = clean(prev.content);
+                    const getAction = (m: Message) => m.tool_calls?.[0] ? JSON.stringify(m.tool_calls[0].function) : null;
 
-                    // Check if BOTH content and first tool call are identical
-                    const lastCmd = last.tool_calls?.[0] ? JSON.stringify(last.tool_calls[0].function) : null;
-                    const prevCmd = prev.tool_calls?.[0] ? JSON.stringify(prev.tool_calls[0].function) : null;
+                    const historyToAudit = assistants.slice(-5);
+                    const last = historyToAudit[historyToAudit.length - 1];
+                    const lastAction = getAction(last);
+                    const lastContent = clean(last.content);
 
-                    if (lastClean === prevClean && lastCmd === prevCmd && lastClean !== "") {
-                        setError("Logic Loop detected (AI is repeating itself). Please change your instruction or use /forget to reset the last turn.");
+                    // Detect pattern repetition in the last 5 assistant turns
+                    const matches = historyToAudit.slice(0, -1).filter(prev => {
+                        return clean(prev.content) === lastContent && getAction(prev) === lastAction;
+                    });
+
+                    if (matches.length >= 2 && lastContent !== "") {
+                        setError("Sovereign Loop Detected: AI is stuck in a repetitive cycle. Use /forget 10 or /clear.");
                         setIsLoading(false);
                         return;
                     }
@@ -615,6 +660,8 @@ ${sysContext}
             if (userIndices.length === 0) return prev;
             const splitIdx = userIndices[Math.max(0, userIndices.length - count)];
             const nextMsgs = prev.slice(0, splitIdx);
+
+            // [Task C] Sync shadow
             shadowMessages = nextMsgs;
             return nextMsgs;
         });

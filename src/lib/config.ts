@@ -17,19 +17,40 @@ const ConfigSchema = z.object({
 
 type Config = z.infer<typeof ConfigSchema>;
 
+// [Task A] Robust deep merge for configuration objects
+function deepMerge<T extends object>(target: T, source: Partial<T>): T {
+    const result = { ...target };
+    for (const key in source) {
+        if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+            (result as any)[key] = deepMerge((target as any)[key] || {}, source[key] as any);
+        } else {
+            (result as any)[key] = source[key];
+        }
+    }
+    return result;
+}
+
 export function getGenericConfig(): Config {
     try {
-        if (!fs.existsSync(CONFIG_FILE)) return { model: 'google/gemini-2.0-flash-exp:free' };
+        if (!fs.existsSync(CONFIG_FILE)) return ConfigSchema.parse({});
         const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
-        return ConfigSchema.parse(JSON.parse(raw));
+        try {
+            return ConfigSchema.parse(JSON.parse(raw));
+        } catch (parseError) {
+            // [Task A] Corruption Recovery: Backup and load defaults
+            const backupFile = CONFIG_FILE + '.bak';
+            fs.copyFileSync(CONFIG_FILE, backupFile);
+            console.error(`[CONFIG ERROR] Corrupted config.json backed up to ${backupFile}. Resetting to defaults.`);
+            return ConfigSchema.parse({});
+        }
     } catch (e) {
-        return { model: 'google/gemini-2.0-flash-exp:free' };
+        return ConfigSchema.parse({});
     }
 }
 
 export function saveConfig(newConfig: Partial<Config>) {
     const current = getGenericConfig();
-    const merged = { ...current, ...newConfig };
+    const merged = deepMerge(current, newConfig); // [Task A] Use deep merge
     fs.writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2));
 }
 

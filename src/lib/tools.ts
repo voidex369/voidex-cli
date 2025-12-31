@@ -28,26 +28,34 @@ export function killActiveProcess() {
     return false;
 }
 
-// 1. Shell / run_shell_command (Updated to support spawn for real-time streaming)
+// 1. Shell / run_shell_command (Hardened)
 export async function runShellCommand({ command, onOutput }: { command: string, onOutput?: StreamCallback }): Promise<ToolResult> {
     return new Promise((resolve) => {
-        const shell = os.platform() === 'win32' ? 'cmd.exe' : '/bin/bash';
+        // [Task A] Shell fallback: Check for bash, otherwise sh
+        let shell = os.platform() === 'win32' ? 'cmd.exe' : '/bin/bash';
+        if (os.platform() !== 'win32' && !fs.existsSync('/bin/bash')) {
+            shell = '/bin/sh';
+        }
+
         const shellArgs = os.platform() === 'win32' ? ['/c', command] : ['-c', command];
 
-
         const child = spawn(shell, shellArgs);
-        activeChildProcess = child; // Track it
+        activeChildProcess = child;
 
-        const MAX_BUFFER_SIZE = 50000; // [STABILITY FIX] Hard limit for memory safety
+        const MAX_BUFFER_SIZE = 50000;
         let output = '';
         let isError = false;
+        let isKilled = false;
 
         const appendSafe = (chunk: string) => {
-            if (output.length < MAX_BUFFER_SIZE) {
-                output += chunk;
-                if (output.length >= MAX_BUFFER_SIZE) {
-                    output += '\n... [TRUNCATED DUE TO MEMORY SAFETY] ...';
-                }
+            if (isKilled) return;
+
+            output += chunk;
+            if (output.length >= MAX_BUFFER_SIZE) {
+                // [Task A] Kill process immediately on OOM
+                child.kill('SIGKILL');
+                isKilled = true;
+                output = output.slice(0, MAX_BUFFER_SIZE) + '\n... [SECURITY/STABILITY KILL: OUTPUT TOO LARGE] ...';
             }
         };
 
@@ -65,17 +73,17 @@ export async function runShellCommand({ command, onOutput }: { command: string, 
         });
 
         child.on('close', (code) => {
-            activeChildProcess = null; // Clear it
+            activeChildProcess = null;
             resolve({
                 output: output.trim() || (code === 0 ? "Command executed successfully" : `Process exited with code ${code}`),
-                isError: code !== 0 || isError
+                isError: code !== 0 || isError || isKilled
             });
         });
 
         child.on('error', (err) => {
             activeChildProcess = null;
             resolve({
-                output: err.message,
+                output: `Spawn error: ${err.message}`,
                 isError: true
             });
         });
@@ -95,8 +103,13 @@ export async function readFile({ path: filePath }: { path: string }): Promise<To
 // 3. ReadFolder / list_directory
 export async function listDirectory({ path: dirPath = '.' }: { path?: string }): Promise<ToolResult> {
     try {
-        const files = fs.readdirSync(path.resolve(process.cwd(), dirPath));
-        return { output: files.join('\n'), isError: false };
+        const absPath = path.resolve(process.cwd(), dirPath);
+        const entries = fs.readdirSync(absPath, { withFileTypes: true });
+
+        // [Task E] Add / suffix to directories
+        const formatted = entries.map(entry => entry.isDirectory() ? entry.name + '/' : entry.name);
+
+        return { output: formatted.join('\n'), isError: false };
     } catch (error: any) {
         return { output: `Error listing directory: ${error.message}`, isError: true };
     }
@@ -133,12 +146,15 @@ export async function glob({ pattern, path: searchPath = '.' }: { pattern: strin
                     if (entry.name === 'node_modules' || entry.name === '.git') continue;
                     await walk(fullPath);
                 } else {
-                    // [LOGIC FIX] Better Glob matching using standard Regex conversion
+                    // [Task F] Advanced Glob matching supporting recursive ** and braces
                     const regexPattern = pattern
                         .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex chars
+                        .replace(/\\\{/g, '{').replace(/\\\}/g, '}') // Keep braces
+                        .replace(/\{([^{}]+)\}/g, (_, group) => `(${group.replace(/,/g, '|')})`) // Braces {a,b} -> (a|b)
                         .replace(/\*\*\//g, '(.+/)?')         // ** matches nested dirs
                         .replace(/\*/g, '[^/]+')              // * matches file chars
                         .replace(/\?/g, '.');                 // ? matches single char
+
                     const matcher = new RegExp(`^${regexPattern}$`);
 
                     if (matcher.test(relPath) || matcher.test(entry.name)) {
@@ -173,10 +189,14 @@ export async function searchText({ query, path: searchPath = '.' }: { query: str
                 } else {
                     try {
                         const content = await fs.promises.readFile(fullPath, 'utf8');
-                        if (content.includes(query)) {
-                            const lines = content.split('\n');
-                            const matchLine = lines.find(l => l.includes(query))?.trim();
-                            results.push(`${relPath}: ${matchLine}`);
+                        const lines = content.split('\n');
+                        const matches = lines
+                            .map((line, idx) => line.includes(query) ? `${relPath}:${idx + 1}: ${line.trim()}` : null)
+                            .filter(Boolean) as string[];
+
+                        // [Task D] Return ALL matches, limit to 20 per file
+                        if (matches.length > 0) {
+                            results.push(...matches.slice(0, 20));
                         }
                     } catch (e) {
                         // Skip binary or unreadable files
@@ -192,7 +212,7 @@ export async function searchText({ query, path: searchPath = '.' }: { query: str
     }
 }
 
-// 7. WebFetch
+// 7. WebFetch (Defensive Binary Handling)
 export async function webFetch({ url }: { url: string }): Promise<ToolResult> {
     try {
         const controller = new AbortController();
@@ -200,7 +220,8 @@ export async function webFetch({ url }: { url: string }): Promise<ToolResult> {
 
         const res = await fetch(url, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': '*/*'
             },
             signal: controller.signal
         });
@@ -208,6 +229,19 @@ export async function webFetch({ url }: { url: string }): Promise<ToolResult> {
         clearTimeout(timeoutId);
 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+        // [Task C] Binary detection
+        const contentType = res.headers.get('content-type') || '';
+        const isBinary = /image|video|audio|pdf|zip|octet-stream/.test(contentType);
+
+        if (isBinary) {
+            const contentLength = res.headers.get('content-length') || 'unknown';
+            return {
+                output: `[BINARY DATA OMITTED - Type: ${contentType}, Size: ${contentLength} bytes]`,
+                isError: false
+            };
+        }
+
         const text = await res.text();
         return { output: text.slice(0, 15000), isError: false };
     } catch (error: any) {
@@ -215,44 +249,50 @@ export async function webFetch({ url }: { url: string }): Promise<ToolResult> {
     }
 }
 
-// 8. Edit / replace (Resilient implementation)
+// 8. Edit / replace (Safe Line-Based Implementation)
 export async function replace({ path: filePath, oldText, newText }: { path: string, oldText: string, newText: string }): Promise<ToolResult> {
     try {
         const absPath = path.resolve(process.cwd(), filePath);
         const content = fs.readFileSync(absPath, 'utf8');
 
-        // [LOGIC FIX] Resilient replacement
-        // 1. Try Exact Match
-        if (content.includes(oldText)) {
-            const updated = content.split(oldText).join(newText);
-            fs.writeFileSync(absPath, updated, 'utf8');
-            return { output: `Successfully replaced exact match in ${filePath}`, isError: false };
-        }
+        // [Task B] Defensive Replacement Strategy
+        const occurrences = content.split(oldText).length - 1;
 
-        // 2. Try Fuzzy Match (normalize whitespace/tabs)
-        const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
-        const normContent = content.split('\n');
-        const normOldLines = oldText.split('\n').filter(l => l.trim() !== '');
+        if (occurrences === 0) {
+            // Try line-based fuzzy fallback for small differences
+            const lines = content.split('\n');
+            const oldLines = oldText.split('\n');
 
-        if (normOldLines.length > 0) {
-            // Very simple line-by-line block matching for single-line or small blocks
-            for (let i = 0; i <= normContent.length - normOldLines.length; i++) {
+            for (let i = 0; i <= lines.length - oldLines.length; i++) {
                 let match = true;
-                for (let j = 0; j < normOldLines.length; j++) {
-                    if (normalize(normContent[i + j]) !== normalize(normOldLines[j])) {
+                for (let j = 0; j < oldLines.length; j++) {
+                    // NO normalisasi whitespace for code projects (Task B)
+                    // But we can trim trailing space just in case
+                    if (lines[i + j].trimEnd() !== oldLines[j].trimEnd()) {
                         match = false;
                         break;
                     }
                 }
                 if (match) {
-                    normContent.splice(i, normOldLines.length, newText);
-                    fs.writeFileSync(absPath, normContent.join('\n'), 'utf8');
-                    return { output: `Successfully replaced fuzzy (whitespace-tolerant) match in ${filePath}`, isError: false };
+                    lines.splice(i, oldLines.length, newText);
+                    fs.writeFileSync(absPath, lines.join('\n'), 'utf8');
+                    return { output: `Successfully applied fuzzy-line replacement in ${filePath}`, isError: false };
                 }
             }
+            return { output: `Error: Text not found in ${filePath}. Check for exact content including indentation.`, isError: true };
         }
 
-        return { output: `Error: Could not find exact or fuzzy match for the specified text in ${filePath}.`, isError: true };
+        if (occurrences > 1) {
+            return {
+                output: `Error: Ambiguous replacement. Found ${occurrences} occurrences of the target text. Please provide a more specific block to replace.`,
+                isError: true
+            };
+        }
+
+        // Exact match replacement (Task B: Global replace disabled logically by check above)
+        const updated = content.replace(oldText, newText);
+        fs.writeFileSync(absPath, updated, 'utf8');
+        return { output: `Successfully replaced exact match in ${filePath}`, isError: false };
     } catch (error: any) {
         return { output: `Replace error: ${error.message}`, isError: true };
     }

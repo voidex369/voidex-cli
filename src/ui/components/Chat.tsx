@@ -76,14 +76,15 @@ const WelcomeBox = React.memo(() => (
 const TruncatedResultBox = React.memo(({ content, isSuccess }: { content: string, isSuccess: boolean }) => {
     if (!content) return <Text dimColor>(no output)</Text>;
 
-    // MEMORY PROTECTION: Absolute cutoff for mega strings
-    if (content.length > 300000) {
+    // [Task A] TTY RENDER LIMIT (Stability): Cap at 10k for performant TTY rendering
+    const RENDER_LIMIT = 10000;
+    if (content.length > RENDER_LIMIT) {
         return (
             <Box flexDirection="column">
                 <Text dimColor>{content.slice(0, 1000)} ...</Text>
                 <Box marginY={1} paddingX={1} borderStyle="single" borderColor="red">
-                    <Text bold color="red">⚠ ULTRA-LARGE OUTPUT ({Math.round(content.length / 1024)} KB)</Text>
-                    <Text color="yellow">Memory protected. Full output hidden.</Text>
+                    <Text bold color="red">⚠ LARGE OUTPUT ({Math.round(content.length / 1024)} KB)</Text>
+                    <Text color="yellow">Memory protected. Full output truncated in terminal.</Text>
                 </Box>
             </Box>
         );
@@ -143,16 +144,20 @@ const MessageItem = React.memo(({ msg }: { msg: Message }) => {
 
                 {/* Tool Calls Area */}
                 {hasTools && msg.tool_calls!.map((tc: any, idx: number) => {
-                    // Parse and format arguments smartly
+                    // [Task B] Optimize performance: Debounced parsing for long tool call buffers
                     let formattedArgs = tc.function.arguments;
-                    try {
-                        const parsed = JSON.parse(tc.function.arguments);
-                        // Truncate long content fields
-                        if (parsed.content && parsed.content.length > 200) {
-                            parsed.content = parsed.content.substring(0, 200) + '... [truncated]';
+                    if (formattedArgs.length > 50) {
+                        try {
+                            const parsed = JSON.parse(tc.function.arguments);
+                            if (parsed.content && parsed.content.length > 100) {
+                                parsed.content = parsed.content.substring(0, 100) + '...';
+                            }
+                            formattedArgs = JSON.stringify(parsed, null, 2);
+                        } catch (e) {
+                            // Fallback to raw during stream
+                            if (formattedArgs.length > 150) formattedArgs = formattedArgs.slice(0, 150) + '...';
                         }
-                        formattedArgs = JSON.stringify(parsed, null, 2);
-                    } catch (e) { }
+                    }
 
                     return (
                         <Box key={idx} flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1} marginTop={idx === 0 ? 0 : 1}>
