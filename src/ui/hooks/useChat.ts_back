@@ -26,16 +26,18 @@ export interface PendingToolCall {
 }
 
 // --- SHADOW PERSISTENCE LAYER ---
+// This keeps the chat state alive even when useChat is unmounted (e.g. during ModelPicker)
 let shadowMessages: Message[] = [{ id: 'welcome', role: 'system', name: 'welcome_msg', content: '' }];
 let shadowAllowedTools: string[] = [];
 let shadowHistory: string[] = [];
 
-// --- LIMITS ---
+// --- EXTREME MEMORY LIMITS ---
 const MAX_CONTENT_LENGTH = 50000;
-const MAX_HISTORY_CHARS = 100000;
-// [FIX 1] NAIKKAN HARD LIMIT DARI 20 KE 50
-const ITERATION_SOFT_LIMIT = 50; 
+const MAX_HISTORY_CHARS = 100000; // [Task A] Hard limit for sliding window (approx tokens)
 
+/**
+ * Truncates content aggressively BEFORE it enters the React state/Shadow.
+ */
 function truncateForRAM(content: string | null): string | null {
     if (!content) return content;
     if (content.length > MAX_CONTENT_LENGTH) {
@@ -44,29 +46,37 @@ function truncateForRAM(content: string | null): string | null {
     return content;
 }
 
+// [Task A] Prune history based on total characters (Estimated Token Limit Pruning)
 function pruneHistoryByChars(messages: Message[]): Message[] {
     let totalChars = 0;
     const result: Message[] = [];
+
+    // Process from newest to oldest
     for (let i = messages.length - 1; i >= 0; i--) {
         const m = messages[i];
         const mChars = (m.content?.length || 0) + (JSON.stringify(m.tool_calls || []).length);
+
         if (totalChars + mChars > MAX_HISTORY_CHARS) {
+            // Keep at least the first user message (pinned goal) if possible, else break
             if (m.role === 'user' && i === messages.findIndex(msg => msg.role === 'user')) {
                 result.unshift(m);
             }
             break;
         }
+
         result.unshift(m);
         totalChars += mChars;
     }
     return result;
 }
 
+
 export function useChat() {
     const config = getGenericConfig();
     const currentApiKey = getApiKey();
 
     const [messages, setMessages] = useState<Message[]>(shadowMessages);
+    // Ref to hold the latest messages without triggering re-renders in callbacks
     const messagesRef = useRef<Message[]>(shadowMessages);
 
     const [isLoading, setIsLoading] = useState(false);
@@ -82,6 +92,7 @@ export function useChat() {
 
     const currentRequestIdRef = useRef<number>(0);
 
+    // Sync state with shadow and refs on every change
     useEffect(() => {
         shadowMessages = messages;
         messagesRef.current = messages;
@@ -117,55 +128,37 @@ ${sysContext}
     const abortController = useRef<AbortController | null>(null);
 
     const stopLoading = useCallback(() => {
+        // 1. Abort AI Generation
         if (abortController.current) {
             abortController.current.abort();
             abortController.current = null;
         }
+        // 2. Clear current request ID to ignore stray updates
         currentRequestIdRef.current++;
+
+        // 3. Kill Active Tool Process (Shell)
         const killed = killActiveProcess();
         if (killed) {
             setMessages(prev => [...prev, { id: 'sys-' + Date.now(), role: 'system', content: '[NOTICE] Active process terminated by user.' }]);
         }
+
         setIsLoading(false);
         setAgentStatus(null);
     }, []);
 
     const processStream = async (stream: any, currentMessages: Message[], client: any, config: any, iterationCount: number, signal: AbortSignal, requestId: number) => {
-        
-        // [FIX 2] SOFT STOP (Konfirmasi User) alih-alih Error Mati
-        if (iterationCount >= ITERATION_SOFT_LIMIT) {
+        if (iterationCount > 20) {
             if (requestId === currentRequestIdRef.current) {
-                setAgentStatus(null); // Stop spinner
-                
-                // Minta izin user untuk melanjutkan
-                setPendingApproval({
-                    tool_call_id: 'sys-limit-' + Date.now(),
-                    name: 'CONTINUE_LONG_TASK', 
-                    arguments: { reason: `Safety limit (${ITERATION_SOFT_LIMIT} steps) reached. Continue?` }
-                });
-
-                const choice = await new Promise<'allow' | 'deny' | 'always'>((resolve) => {
-                    approvalResolver.current = resolve;
-                });
-
-                setPendingApproval(null);
-                approvalResolver.current = null;
-
-                if (choice === 'deny') {
-                    setMessages(prev => [...prev, {
-                        id: 'sys-stop-' + Date.now(),
-                        role: 'system',
-                        content: '[STOPPED] User chose to stop the agent after safety limit.'
-                    }]);
-                    setIsLoading(false);
-                    return;
-                }
-                
-                // Jika Allow/Always, RESET counter jadi 0 biar bisa lanjut 50 langkah lagi
-                iterationCount = 0;
+                setMessages(prev => [...prev, {
+                    id: 'sys-limit-' + Date.now(),
+                    role: 'system',
+                    content: '[ERROR] Max tool iteration limit (20) reached. Stopping infinite loop.'
+                }]);
             }
+            return;
         }
 
+        // [Task C] Ensure local state scope
         const assistantMsg: Message = {
             id: 'assistant-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
             role: 'assistant',
@@ -173,12 +166,12 @@ ${sysContext}
             tool_calls: []
         };
 
-        // Add placeholder immediately
+        // Add placeholder
         setMessages((prev) => [...prev, assistantMsg]);
 
         let toolCallsBuffer: any[] = [];
         let lastUpdate = 0;
-        const UPDATE_INTERVAL = 100;
+        const UPDATE_INTERVAL = 100; // Update UI every 100ms max
 
         try {
             for await (const chunk of stream) {
@@ -187,10 +180,12 @@ ${sysContext}
                 if (delta?.content) {
                     assistantMsg.content = (assistantMsg.content || '') + delta.content;
 
+                    // PRE-STATE TRUNCATION (Live)
                     if ((assistantMsg.content?.length || 0) > MAX_CONTENT_LENGTH) {
                         assistantMsg.content = truncateForRAM(assistantMsg.content);
                     }
 
+                    // THROTTLED UPDATE: Only update UI if TTY or interval reached
                     const now = Date.now();
                     const isTTY = process.stdout.isTTY;
 
@@ -225,11 +220,10 @@ ${sysContext}
             throw e;
         }
 
+        // FINAL UPDATE: Ensure last content is displayed
         if (requestId === currentRequestIdRef.current) {
             setMessages((prev) => {
                 const newMsgs = [...prev];
-                // [FIX 4] Empty Bubble Fix: Kalau konten kosong dan gak ada tool, jangan update (atau bisa dihapus)
-                // Tapi kita keep logic standar, hanya pastikan update terakhir masuk.
                 newMsgs[newMsgs.length - 1] = { ...assistantMsg };
                 return newMsgs;
             });
@@ -247,6 +241,8 @@ ${sysContext}
                 const toolMessages: Message[] = [];
                 for (const tc of assistantMsg.tool_calls || []) {
                     const toolName = tc.function.name;
+
+                    // [Task B] Hardened JSON parsing & validation
                     let args: any = {};
                     try {
                         args = JSON.parse(tc.function.arguments || '{}');
@@ -256,11 +252,12 @@ ${sysContext}
                         continue;
                     }
 
-                    const needsApproval = ['write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash'].includes(toolName);
+                    const needsApproval = ['write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash'].includes(toolName); // [SECURITY FIX]
                     const isWhitelisted = allowedToolsRef.current.includes(toolName);
 
                     let proceed = true;
                     if (needsApproval && !isWhitelisted) {
+                        // [Fix] Disable status spinner during approval to prevent render bloom
                         setAgentStatus(null);
                         setPendingApproval({ tool_call_id: tc.id, name: toolName, arguments: args });
 
@@ -292,11 +289,14 @@ ${sysContext}
                             setAgentStatus(`Executing ${toolName}...`);
                             const toolFunc = toolRegistry[toolName as keyof typeof toolRegistry];
 
+                            // [Task B] Pre-execution Validation
                             if (toolFunc) {
+                                // Basic validation for common tools
                                 if (['read_file', 'write_file', 'replace'].includes(toolName) && typeof args.path !== 'string') {
                                     throw new Error(`Missing required 'path' argument (string) for ${toolName}`);
                                 }
 
+                                // [FIX] REGRESSION: Live Output Strategy (Immediate & Rolling Window)
                                 let streamBuffer = '';
                                 let lastStreamUpdate = 0;
 
@@ -304,13 +304,18 @@ ${sysContext}
                                     ...args,
                                     onOutput: (chunk: string) => {
                                         streamBuffer += chunk;
+                                        
                                         const now = Date.now();
+                                        // Update IMMEDIATELY if newline found (responsiveness) OR every 50ms (smoothness)
+                                        // This fixes the "Delayed/Burst" output issue.
                                         if (chunk.includes('\n') || (now - lastStreamUpdate > 50)) {
                                             const pending = streamBuffer;
                                             streamBuffer = '';
                                             lastStreamUpdate = now;
+
                                             setLiveToolOutput(prev => {
                                                 const combined = prev + pending;
+                                                // [Task] Rolling Window: Keep last 20 lines max to prevent lag
                                                 const lines = combined.split('\n');
                                                 if (lines.length > 20) {
                                                     return lines.slice(-20).join('\n');
@@ -321,6 +326,7 @@ ${sysContext}
                                     }
                                 });
 
+                                // Flush any remaining bit in the buffer
                                 if (streamBuffer) {
                                     setLiveToolOutput(prev => {
                                         const lines = (prev + streamBuffer).split('\n');
@@ -347,6 +353,7 @@ ${sysContext}
                                 throw new Error(`Tool ${toolName} not found`);
                             }
                         } catch (err: any) {
+                            // [Task B] Graceful catch for tool execution crashes
                             const errorMsg: Message = {
                                 id: 'tool-err-' + Date.now(),
                                 role: 'tool',
@@ -381,41 +388,45 @@ ${sysContext}
 
                 await new Promise(resolve => setTimeout(resolve, 1000));
 
+                // --- [Task A] SLIDING WINDOW (Character Based) ---
                 const firstUserIdx = nextMessages.findIndex(m => m.role === 'user');
                 const firstUserMsg = firstUserIdx !== -1 ? nextMessages[firstUserIdx] : null;
 
+                // Apply character-based pruning
                 let recentMessages = pruneHistoryByChars(nextMessages);
 
+                // Ensure the pinned goal is ALWAYS present
                 if (firstUserMsg && !recentMessages.find(m => m.id === firstUserMsg.id)) {
                     recentMessages = [firstUserMsg, ...recentMessages];
                 }
 
+                // ZOMBIE CHECK: If user aborted during tool execution, STOP here.
                 if (!abortController.current) return;
 
-                // [FIX 3] SMART LOOP DETECTION
-                // Cek apakah 3 perintah terakhir SAMA PERSIS. Kalau variatif, biarkan lewat.
+                // [Task D] ADVANCED LOOP DETECTION: (Scan 3-5 deep)
                 const assistants = nextMessages.filter(m => m.role === 'assistant');
                 if (assistants.length >= 3) {
-                    const getAction = (m: Message) => {
-                        if (!m.tool_calls || m.tool_calls.length === 0) return null;
-                        // Compare entire function object (name + arguments)
-                        return JSON.stringify(m.tool_calls[0].function);
-                    };
+                    const clean = (s: string | null) => (s || '').replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F1E0}-\u{1F1FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}]/gu, '').toLowerCase().trim();
+                    const getAction = (m: Message) => m.tool_calls?.[0] ? JSON.stringify(m.tool_calls[0].function) : null;
 
-                    const historyToAudit = assistants.slice(-3); // Cek 3 terakhir
-                    const lastAction = getAction(historyToAudit[historyToAudit.length - 1]);
-                    
-                    // Validasi: Apakah ketiganya punya aksi yang SAMA PERSIS?
-                    const isRepetitive = historyToAudit.every(m => getAction(m) === lastAction && lastAction !== null);
+                    const historyToAudit = assistants.slice(-5);
+                    const last = historyToAudit[historyToAudit.length - 1];
+                    const lastAction = getAction(last);
+                    const lastContent = clean(last.content);
 
-                    if (isRepetitive) {
-                        setError("Sovereign Loop Detected: Agent stuck executing exact same command 3x. Use /forget to reset.");
+                    // Detect pattern repetition in the last 5 assistant turns
+                    const matches = historyToAudit.slice(0, -1).filter(prev => {
+                        return clean(prev.content) === lastContent && getAction(prev) === lastAction;
+                    });
+
+                    if (matches.length >= 2 && lastContent !== "") {
+                        setError("Sovereign Loop Detected: AI is stuck in a repetitive cycle. Use /forget 10 or /clear.");
                         setIsLoading(false);
                         return;
                     }
                 }
 
-                // RECURSIVE CALL
+                // ONLY RECURSE IF TOOLS WERE CALLED OR HEAL NEEDED
                 if (toolCallsBuffer.length === 0 && !needsHeal) {
                     setIsLoading(false);
                     setAgentStatus(null);
@@ -438,16 +449,14 @@ ${sysContext}
                     stream: true,
                     tools: toolsDefinition as any,
                 }, { signal });
-                
-                // Increment counter hanya saat rekursi terjadi
                 await processStream(nextStream, nextMessages, client, config, iterationCount + 1, signal, requestId);
             } catch (e: any) {
                 if (e.name === 'AbortError' || requestId !== currentRequestIdRef.current) return;
-                console.error("Stream processing error:", e);
+                console.error("Stream processing error:", e); // Log for debug
                 if (e.message.includes('429')) {
-                    setError('Rate limit hit (429). Retrying...');
-                } else if (e.message.includes('context_length_exceeded')) {
-                    setError('Context limit exceeded. Use /clear.');
+                    setError('Rate limit hit (429). Try again in a moment.');
+                } else if (e.message.includes('context_length_exceeded') || e.code === 'context_length_exceeded') {
+                    setError('Context limit exceeded. Please use /clear to reset memory.');
                 } else {
                     setError(`Connection Error: ${e.message}`);
                 }
@@ -455,6 +464,7 @@ ${sysContext}
         }
     };
 
+    // STABLE SEND MESSAGE - No dependencies on 'messages' or 'allowedTools'
     const sendMessage = useCallback(async (rawContent: string) => {
         const content = rawContent.trim();
         if (!content) return;
@@ -534,6 +544,7 @@ ${sysContext}
                 return;
             }
 
+            // Show usage if command is incomplete or invalid sub-command
             const usage = `Usage: /chat [save <id> | resume <id> | list | delete <id> | share <file>]`;
             setMessages(prev => [...prev, { id: 'sys-' + Date.now(), role: 'system', content: usage }]);
             return;
@@ -562,12 +573,15 @@ ${sysContext}
 
         const userMsg: Message = { id: 'user-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7), role: 'user', content: truncateForRAM(content) };
 
+        // 1. KILL ANY EXISTING PROCESS AND REQUEST
         stopLoading();
 
+        // 2. START NEW REQUEST
         const requestId = currentRequestIdRef.current;
         abortController.current = new AbortController();
         const signal = abortController.current.signal;
 
+        // Use REF to get current messages
         let currentMsgs = [...messagesRef.current, userMsg];
 
         setMessages(currentMsgs);
@@ -592,6 +606,8 @@ ${sysContext}
 
         try {
             const client = createClient(latestApiKey!);
+
+            // --- PINNED CONTEXT (Initial) ---
             const firstUserIdx = currentMsgs.findIndex(m => m.role === 'user');
             const firstUserMsg = firstUserIdx !== -1 ? currentMsgs[firstUserIdx] : null;
 
@@ -608,11 +624,13 @@ ${sysContext}
                     ...recentMessages
                         .filter(m => {
                             if (m.role === 'system' && ['welcome_msg', 'help_menu', 'tools_list'].includes(m.name || '')) return false;
+                            // Filter out empty assistant messages that don't have tool calls
                             if (m.role === 'assistant' && !m.content?.trim() && (!m.tool_calls || m.tool_calls.length === 0)) return false;
                             return true;
                         })
                         .map(m => {
                             const role = (m.role === 'system' || m.role === 'tool') ? m.role : m.role;
+                            // Ensure content is trimmed to stop AI mirroring whitespaces
                             const msg: any = { role, content: (m.content || '').trim() };
                             if (m.role === 'assistant' && m.tool_calls) msg.tool_calls = m.tool_calls;
                             if (m.role === 'tool') msg.tool_call_id = m.tool_call_id;
@@ -629,10 +647,11 @@ ${sysContext}
             }
         } catch (err: any) {
             if (err.name === 'AbortError' || requestId !== currentRequestIdRef.current) {
+                // Ignore stale results
                 return;
             } else if (err.message.includes('429')) {
-                setError('Rate limit consistently hit (429). Try again later.');
-            } else if (err.message.includes('context_length_exceeded')) {
+                setError('Rate limit consistently hit (429). Try again later or use a different model.');
+            } else if (err.message.includes('context_length_exceeded') || err.code === 'context_length_exceeded') {
                 setError('Context limit exceeded. Use /clear to start fresh.');
             } else {
                 setError(`Error: ${err.message || 'Unknown network error'}`);
@@ -653,21 +672,35 @@ ${sysContext}
             if (userIndices.length === 0) return prev;
             const splitIdx = userIndices[Math.max(0, userIndices.length - count)];
             const nextMsgs = prev.slice(0, splitIdx);
+
+            // [Task C] Sync shadow
             shadowMessages = nextMsgs;
             return nextMsgs;
         });
     }, []);
 
     return {
-        messages, isLoading, error, sendMessage, agentStatus,
+        messages,
+        isLoading,
+        error,
+        sendMessage,
+        agentStatus,
         clearMessages: () => { setMessages([{ id: 'welcome', role: 'system', name: 'welcome_msg', content: '' }]); shadowMessages = []; },
-        activeDialog, setActiveDialog, getAvailableModels, saveModel, saveApiKey,
-        apiKey: getApiKey() || currentApiKey, stopLoading,
+        activeDialog,
+        setActiveDialog,
+        getAvailableModels,
+        saveModel,
+        saveApiKey,
+        apiKey: getApiKey() || currentApiKey,
+        stopLoading,
         hasMemory: fs.existsSync(path.join(os.homedir(), '.voidex-cli', 'memory.md')),
         pendingApproval,
         resolveApproval: (choice: 'allow' | 'deny' | 'always') => {
             if (approvalResolver.current) approvalResolver.current(choice);
         },
-        liveToolOutput, history, setHistory, forgetMessages
+        liveToolOutput,
+        history,
+        setHistory,
+        forgetMessages
     };
 }
