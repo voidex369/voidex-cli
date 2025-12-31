@@ -1,8 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Box, Text, useInput, useApp, Static } from 'ink';
 import TextInput from 'ink-text-input';
-// [FIX] Hapus import Spinner (sudah kita matikan sebelumnya)
-// import Spinner from 'ink-spinner'; 
+import Spinner from 'ink-spinner';
 import Gradient from 'ink-gradient';
 import { useChat, Message } from '../hooks/useChat.js';
 import { getAvailableModels, saveModel, saveApiKey, getApiKey, getModelDisplayName } from '../../lib/config.js';
@@ -77,6 +76,7 @@ const WelcomeBox = React.memo(() => (
 const TruncatedResultBox = React.memo(({ content, isSuccess }: { content: string, isSuccess: boolean }) => {
     if (!content) return <Text dimColor>(no output)</Text>;
 
+    // [Task A] TTY RENDER LIMIT (Stability): Cap at 10k for performant TTY rendering
     const RENDER_LIMIT = 10000;
     if (content.length > RENDER_LIMIT) {
         return (
@@ -144,6 +144,7 @@ const MessageItem = React.memo(({ msg }: { msg: Message }) => {
 
                 {/* Tool Calls Area */}
                 {hasTools && msg.tool_calls!.map((tc: any, idx: number) => {
+                    // [Task B] Optimize performance: Debounced parsing for long tool call buffers
                     let formattedArgs = tc.function.arguments;
                     if (formattedArgs.length > 50) {
                         try {
@@ -153,6 +154,7 @@ const MessageItem = React.memo(({ msg }: { msg: Message }) => {
                             }
                             formattedArgs = JSON.stringify(parsed, null, 2);
                         } catch (e) {
+                            // Fallback to raw during stream
                             if (formattedArgs.length > 150) formattedArgs = formattedArgs.slice(0, 150) + '...';
                         }
                     }
@@ -187,6 +189,7 @@ const ModelPicker = React.memo(({ onSelect, onCancel, models }: any) => {
     const startIndex = Math.floor(selectedIndex / visibleCount) * visibleCount;
     const visible = useMemo(() => filtered.slice(startIndex, startIndex + visibleCount), [filtered, startIndex]);
 
+    // Use a single input handler to prevent leaks
     useInput((input, key) => {
         if (totalCount === 0) {
             if (key.escape || (key.ctrl && input === 'c')) onCancel();
@@ -209,11 +212,13 @@ const ModelPicker = React.memo(({ onSelect, onCancel, models }: any) => {
                 <TextInput value={filter} onChange={(v) => { setFilter(v); setSelectedIndex(0); }} placeholder="Search models..." />
             </Box>
 
+            {/* Flat list to avoid layout depth issues */}
             <Box flexDirection="column" flexShrink={0}>
                 {visible.map((m: string, i: number) => {
                     const absIdx = startIndex + i;
                     const isSel = absIdx === selectedIndex;
                     const displayName = getModelDisplayName(m);
+                    // Manual truncation to be safe for Yoga
                     const safeName = displayName.length > 70 ? displayName.slice(0, 67) + '...' : displayName;
 
                     return (
@@ -237,6 +242,7 @@ const AuthDialog = React.memo(({ onSave, onCancel, currentKey }: any) => {
     const [key, setKey] = useState('');
 
     useInput((input, keyData) => {
+        // More robust key check
         if (keyData.escape) onCancel();
         if (keyData.ctrl && input.toLowerCase() === 'c') onCancel();
     });
@@ -270,7 +276,7 @@ const StatusArea = React.memo(({ agentStatus, liveToolOutput, pendingApproval, a
         <Box flexDirection="column" flexShrink={0}>
             {agentStatus && (
                 <Box borderStyle="single" borderColor="yellow" paddingX={1} marginBottom={1} flexDirection="column">
-                    <Box><Text color="yellow">⏳</Text><Text> {agentStatus}</Text></Box>
+                    <Box><Spinner type="dots" /><Text> {agentStatus}</Text></Box>
                     {cappedOutput && <Box marginTop={1} paddingX={1} borderStyle="single" borderColor="gray"><Text color="gray">{cappedOutput}</Text></Box>}
                 </Box>
             )}
@@ -325,49 +331,25 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
     const [apprIdx, setApprIdx] = useState(0);
     const apprOpts = useMemo(() => [{ label: 'Allow once', value: 'allow' }, { label: 'Always', value: 'always' }, { label: 'Deny', value: 'deny' }], []);
 
+    // Local index for history navigation (can be reset on unmount, but list is persistent)
     const [histIdx, setHistIdx] = useState(-1);
+
+    // Double Ctrl+C Exit Safety
     const lastCtrlCTime = useRef(0);
     const [showExitNotice, setShowExitNotice] = useState(false);
 
+    // Static vs Active Split logic + Windowing
     const isTTY = process.stdout.isTTY;
-    const prevStaticRef = useRef<Message[]>([]);
+    const isStreaming = isLoading && messages.length > 0;
 
-    // [FIX 3] DOUBLE PRINTING SOLVED:
-    // Kita memaksa pesan terakhir (Assistant) tetap di status "Active" (bukan Static)
-    // meskipun streaming sudah selesai. Ini mencegah transisi re-render yang menyebabkan teks tercetak ganda.
-    // Pesan ini baru akan masuk ke <Static> (history) ketika user mengirim pesan BERIKUTNYA.
-    const isLastMessageAssistant = messages.length > 0 && messages[messages.length - 1].role === 'assistant';
-    const shouldKeepActive = isTTY && (isLoading || isLastMessageAssistant);
-
+    // [Fix] Memoize message splitting to prevent Static reprint bloom
     const { staticMessages, activeMessage } = useMemo(() => {
         const RENDER_WINDOW = 150;
         const windowed = messages.length > RENDER_WINDOW ? messages.slice(-RENDER_WINDOW) : messages;
-        
-        let staticMsgs: Message[];
-        let activeMsg: Message | null = null;
-
-        if (shouldKeepActive) {
-            // Keep the last message in Active slot
-            staticMsgs = windowed.slice(0, -1);
-            activeMsg = windowed[windowed.length - 1];
-        } else {
-            // Flush all to static
-            staticMsgs = windowed;
-            activeMsg = null;
-        }
-
-        // Deep stability check to prevent Static refresh
-        if (
-            staticMsgs.length === prevStaticRef.current.length &&
-            staticMsgs.every((m, i) => m === prevStaticRef.current[i])
-        ) {
-            staticMsgs = prevStaticRef.current;
-        } else {
-            prevStaticRef.current = staticMsgs;
-        }
-
-        return { staticMessages: staticMsgs, activeMessage: activeMsg };
-    }, [messages, shouldKeepActive, isTTY]);
+        const sMsgs = (isStreaming && isTTY) ? windowed.slice(0, -1) : windowed;
+        const aMsg = (isStreaming && isTTY) ? windowed[windowed.length - 1] : null;
+        return { staticMessages: sMsgs, activeMessage: aMsg };
+    }, [messages, isStreaming, isTTY]);
 
     useEffect(() => {
         const allCmds = [
@@ -396,9 +378,12 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
             const isToolsMode = input.startsWith('/tools');
 
             const filtered = allCmds.filter(c => {
+                // Hierarchical filtering:
                 if (isChatMode) return c.parent === '/chat' && c.cmd.startsWith(input) && c.cmd !== input;
                 if (isStatsMode) return c.parent === '/stats' && c.cmd.startsWith(input) && c.cmd !== input;
                 if (isToolsMode) return c.parent === '/tools' && c.cmd.startsWith(input) && c.cmd !== input;
+
+                // Otherwise hide sub-commands
                 return !c.parent && c.cmd.startsWith(input) && c.cmd !== input;
             });
             setSuggestions(filtered);
@@ -442,6 +427,7 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
             return;
         }
 
+        // Standard History Navigation
         if (key.upArrow) {
             setHistIdx(prev => {
                 const newIdx = Math.min(prev + 1, history.length - 1);
@@ -457,14 +443,14 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
                 return newIdx;
             });
         }
-        else if (key.pageUp) {
+        else if (key.pageUp) { // Jump to older history
             setHistIdx(prev => {
                 const newIdx = Math.min(prev + 5, history.length - 1);
                 if (newIdx !== prev && newIdx >= 0) setInput(history[history.length - 1 - newIdx]);
                 return newIdx;
             });
         }
-        else if (key.pageDown) {
+        else if (key.pageDown) { // Jump to newer history
             setHistIdx(prev => {
                 const newIdx = Math.max(prev - 5, -1);
                 if (newIdx === -1) setInput('');
@@ -501,7 +487,7 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
 
     return (
         <Box flexDirection="column" width="100%">
-            {/* Static History */}
+            {/* Static History: Renders once and forgets */}
             <Static items={staticMessages}>
                 {(msg: any) => (
                     <Box key={msg.id} width="100%">
@@ -517,11 +503,12 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
                 </Box>
             )}
 
-            {/* Footer Area */}
+            {/* Footer Area: Status & Input */}
             <Box flexDirection="column" marginTop={1} borderStyle="single" borderColor="gray" paddingTop={1}>
                 {showExitNotice && <Box marginLeft={1} marginBottom={1}><Text color="yellow" bold>⚠ Press Ctrl+C again to exit</Text></Box>}
                 {error && <Text color="red" bold>✖ Error: {error}</Text>}
                 {hasMemory && <Box marginLeft={1} marginBottom={1}><Text dimColor italic>Sovereign memory active</Text></Box>}
+                {/* Status only shown in TTY to avoid log bloating */}
                 {isTTY && <StatusArea agentStatus={agentStatus} liveToolOutput={liveToolOutput} pendingApproval={pendingApproval} approvalOptions={apprOpts} approvalIndex={apprIdx} />}
                 <InputArea input={input} setInput={setInput} handleSend={handleSend} suggestions={suggestions} selectedIndex={selIdx} />
             </Box>
@@ -529,6 +516,7 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
     );
 });
 
+// --- Root Chat Component (Switcher) ---
 export default function Chat() {
     const chatState = useChat();
     const { sendMessage } = chatState;
