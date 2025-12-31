@@ -218,7 +218,7 @@ ${sysContext}
                     let args = {};
                     try { args = JSON.parse(tc.function.arguments); } catch (e) { }
 
-                    const needsApproval = ['write_file', 'writeFile', 'replace'].includes(toolName);
+                    const needsApproval = ['write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash'].includes(toolName); // [SECURITY FIX]
                     const isWhitelisted = allowedToolsRef.current.includes(toolName);
 
                     let proceed = true;

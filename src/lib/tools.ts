@@ -38,18 +38,28 @@ export async function runShellCommand({ command, onOutput }: { command: string, 
         const child = spawn(shell, shellArgs);
         activeChildProcess = child; // Track it
 
+        const MAX_BUFFER_SIZE = 50000; // [STABILITY FIX] Hard limit for memory safety
         let output = '';
         let isError = false;
 
+        const appendSafe = (chunk: string) => {
+            if (output.length < MAX_BUFFER_SIZE) {
+                output += chunk;
+                if (output.length >= MAX_BUFFER_SIZE) {
+                    output += '\n... [TRUNCATED DUE TO MEMORY SAFETY] ...';
+                }
+            }
+        };
+
         child.stdout.on('data', (data) => {
             const chunk = data.toString();
-            output += chunk;
+            appendSafe(chunk);
             if (onOutput) onOutput(chunk);
         });
 
         child.stderr.on('data', (data) => {
             const chunk = data.toString();
-            output += chunk;
+            appendSafe(chunk);
             isError = true;
             if (onOutput) onOutput(chunk);
         });
@@ -123,12 +133,17 @@ export async function glob({ pattern, path: searchPath = '.' }: { pattern: strin
                     if (entry.name === 'node_modules' || entry.name === '.git') continue;
                     await walk(fullPath);
                 } else {
-                    // Simple pattern match (starts/ends with * or exact)
-                    const isMatch = pattern.includes('*')
-                        ? (pattern.startsWith('*') ? entry.name.endsWith(pattern.slice(1)) : entry.name.startsWith(pattern.slice(0, -1)))
-                        : entry.name === pattern;
+                    // [LOGIC FIX] Better Glob matching using standard Regex conversion
+                    const regexPattern = pattern
+                        .replace(/[.+^${}()|[\]\\]/g, '\\$&') // Escape regex chars
+                        .replace(/\*\*\//g, '(.+/)?')         // ** matches nested dirs
+                        .replace(/\*/g, '[^/]+')              // * matches file chars
+                        .replace(/\?/g, '.');                 // ? matches single char
+                    const matcher = new RegExp(`^${regexPattern}$`);
 
-                    if (isMatch) results.push(relPath);
+                    if (matcher.test(relPath) || matcher.test(entry.name)) {
+                        results.push(relPath);
+                    }
                 }
             }
         }
@@ -200,17 +215,44 @@ export async function webFetch({ url }: { url: string }): Promise<ToolResult> {
     }
 }
 
-// 8. Edit / replace (Global string replacement)
+// 8. Edit / replace (Resilient implementation)
 export async function replace({ path: filePath, oldText, newText }: { path: string, oldText: string, newText: string }): Promise<ToolResult> {
     try {
         const absPath = path.resolve(process.cwd(), filePath);
         const content = fs.readFileSync(absPath, 'utf8');
-        if (!content.includes(oldText)) return { output: `Error: Text "${oldText}" not found in ${filePath}.`, isError: true };
 
-        // Use split/join for global replacement without regex escaping issues
-        const updated = content.split(oldText).join(newText);
-        fs.writeFileSync(absPath, updated, 'utf8');
-        return { output: `Successfully replaced all occurrences of text in ${filePath}`, isError: false };
+        // [LOGIC FIX] Resilient replacement
+        // 1. Try Exact Match
+        if (content.includes(oldText)) {
+            const updated = content.split(oldText).join(newText);
+            fs.writeFileSync(absPath, updated, 'utf8');
+            return { output: `Successfully replaced exact match in ${filePath}`, isError: false };
+        }
+
+        // 2. Try Fuzzy Match (normalize whitespace/tabs)
+        const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
+        const normContent = content.split('\n');
+        const normOldLines = oldText.split('\n').filter(l => l.trim() !== '');
+
+        if (normOldLines.length > 0) {
+            // Very simple line-by-line block matching for single-line or small blocks
+            for (let i = 0; i <= normContent.length - normOldLines.length; i++) {
+                let match = true;
+                for (let j = 0; j < normOldLines.length; j++) {
+                    if (normalize(normContent[i + j]) !== normalize(normOldLines[j])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    normContent.splice(i, normOldLines.length, newText);
+                    fs.writeFileSync(absPath, normContent.join('\n'), 'utf8');
+                    return { output: `Successfully replaced fuzzy (whitespace-tolerant) match in ${filePath}`, isError: false };
+                }
+            }
+        }
+
+        return { output: `Error: Could not find exact or fuzzy match for the specified text in ${filePath}.`, isError: true };
     } catch (error: any) {
         return { output: `Replace error: ${error.message}`, isError: true };
     }
