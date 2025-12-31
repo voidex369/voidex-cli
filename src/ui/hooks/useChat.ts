@@ -257,7 +257,8 @@ ${sysContext}
 
                     let proceed = true;
                     if (needsApproval && !isWhitelisted) {
-                        setAgentStatus(`Awaiting approval for ${toolName}...`);
+                        // [Fix] Disable status spinner during approval to prevent render bloom
+                        setAgentStatus(null);
                         setPendingApproval({ tool_call_id: tc.id, name: toolName, arguments: args });
 
                         const choice = await new Promise<'allow' | 'deny' | 'always'>((resolve) => {

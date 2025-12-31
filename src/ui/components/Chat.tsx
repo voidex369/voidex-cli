@@ -342,14 +342,14 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
     const isTTY = process.stdout.isTTY;
     const isStreaming = isLoading && messages.length > 0;
 
-    // Limit rendered messages to prevent Yoga layout explosion
-    const RENDER_WINDOW = 150;
-    const windowed = messages.length > RENDER_WINDOW ? messages.slice(-RENDER_WINDOW) : messages;
-
-    // NON-TTY OPTIMIZATION: In a redirected log, treat ALL messages as static 
-    // to prevent infinite frame appends. In TTY, keep the streaming feel.
-    const staticMessages = (isStreaming && isTTY) ? windowed.slice(0, -1) : windowed;
-    const activeMessage = (isStreaming && isTTY) ? windowed[windowed.length - 1] : null;
+    // [Fix] Memoize message splitting to prevent Static reprint bloom
+    const { staticMessages, activeMessage } = useMemo(() => {
+        const RENDER_WINDOW = 150;
+        const windowed = messages.length > RENDER_WINDOW ? messages.slice(-RENDER_WINDOW) : messages;
+        const sMsgs = (isStreaming && isTTY) ? windowed.slice(0, -1) : windowed;
+        const aMsg = (isStreaming && isTTY) ? windowed[windowed.length - 1] : null;
+        return { staticMessages: sMsgs, activeMessage: aMsg };
+    }, [messages, isStreaming, isTTY]);
 
     useEffect(() => {
         const allCmds = [
