@@ -28,31 +28,57 @@ export function killActiveProcess() {
     return false;
 }
 
-// 1. Shell / run_shell_command (Hardened)
-export async function runShellCommand({ command, onOutput }: { command: string, onOutput?: StreamCallback }): Promise<ToolResult> {
+// 1. Shell / run_shell_command (Hardened with Inactivity Timeout)
+export async function runShellCommand({ command, onOutput, timeout }: { command: string, onOutput?: StreamCallback, timeout?: number }): Promise<ToolResult> {
+    const isWin = os.platform() === 'win32';
+
+    // [SECURITY REJECTION] Sudo Guard: Prevent interactive sudo attempts
+    if (!isWin && command.trim().startsWith('sudo') && !command.includes(' -S')) {
+        return {
+            output: "Minta password sudo ke user, lalu coba lagi perintahnya menggunakan format: echo 'PASSWORD' | sudo -S [perintah]",
+            isError: true
+        };
+    }
+
     return new Promise((resolve) => {
-        // [Task A] Shell fallback: Check for bash, otherwise sh
-        let shell = os.platform() === 'win32' ? 'cmd.exe' : '/bin/bash';
-        if (os.platform() !== 'win32' && !fs.existsSync('/bin/bash')) {
+        let shell = isWin ? 'cmd.exe' : '/bin/bash';
+        if (!isWin && !fs.existsSync('/bin/bash')) {
             shell = '/bin/sh';
         }
 
-        const shellArgs = os.platform() === 'win32' ? ['/c', command] : ['-c', command];
-
+        const shellArgs = isWin ? ['/c', command] : ['-c', command];
         const child = spawn(shell, shellArgs);
         activeChildProcess = child;
 
         const MAX_BUFFER_SIZE = 50000;
+        const IDLE_TIMEOUT = timeout || 30000; // Use parameter or default 30s
         let output = '';
         let isError = false;
         let isKilled = false;
+        let isTimeout = false;
+        let timer: NodeJS.Timeout;
+
+        const killOnTimeout = () => {
+            if (activeChildProcess === child) {
+                isTimeout = true;
+                isKilled = true;
+                child.kill('SIGKILL');
+            }
+        };
+
+        const resetTimer = () => {
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(killOnTimeout, IDLE_TIMEOUT);
+        };
+
+        // Initialize first timer
+        resetTimer();
 
         const appendSafe = (chunk: string) => {
             if (isKilled) return;
 
             output += chunk;
             if (output.length >= MAX_BUFFER_SIZE) {
-                // [Task A] Kill process immediately on OOM
                 child.kill('SIGKILL');
                 isKilled = true;
                 output = output.slice(0, MAX_BUFFER_SIZE) + '\n... [SECURITY/STABILITY KILL: OUTPUT TOO LARGE] ...';
@@ -60,12 +86,14 @@ export async function runShellCommand({ command, onOutput }: { command: string, 
         };
 
         child.stdout.on('data', (data) => {
+            resetTimer(); // Keep-alive: Reset timer on active output
             const chunk = data.toString();
             appendSafe(chunk);
             if (onOutput) onOutput(chunk);
         });
 
         child.stderr.on('data', (data) => {
+            resetTimer(); // Keep-alive: Reset timer on active error output
             const chunk = data.toString();
             appendSafe(chunk);
             isError = true;
@@ -73,14 +101,22 @@ export async function runShellCommand({ command, onOutput }: { command: string, 
         });
 
         child.on('close', (code) => {
+            if (timer) clearTimeout(timer);
             activeChildProcess = null;
+
+            let finalOutput = output.trim();
+            if (isTimeout) {
+                finalOutput += `\n\n[IDLE TIMEOUT - ${IDLE_TIMEOUT}ms] Beritahu user bahwa perintah macet/menunggu. Minta argumen tambahan ke user untuk memperbaikinya (misal: tambah -y) atau input manual.`;
+            }
+
             resolve({
-                output: output.trim() || (code === 0 ? "Command executed successfully" : `Process exited with code ${code}`),
+                output: finalOutput || (code === 0 ? "Command executed successfully" : `Process exited with code ${code}`),
                 isError: code !== 0 || isError || isKilled
             });
         });
 
         child.on('error', (err) => {
+            if (timer) clearTimeout(timer);
             activeChildProcess = null;
             resolve({
                 output: `Spawn error: ${err.message}`,
