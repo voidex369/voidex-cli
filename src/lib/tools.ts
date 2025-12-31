@@ -290,7 +290,8 @@ export async function replace({ path: filePath, oldText, newText }: { path: stri
         }
 
         // Exact match replacement (Task B: Global replace disabled logically by check above)
-        const updated = content.replace(oldText, newText);
+        // [Task] Fix Dollar Sign Trap by using a callback
+        const updated = content.replace(oldText, () => newText);
         fs.writeFileSync(absPath, updated, 'utf8');
         return { output: `Successfully replaced exact match in ${filePath}`, isError: false };
     } catch (error: any) {
