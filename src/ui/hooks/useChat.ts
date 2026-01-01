@@ -9,21 +9,10 @@ import { getSystemContext } from '../../lib/context.js';
 import os from 'os';
 import fs from 'fs';
 import path from 'path';
+import { LocalExecutor } from '../../lib/agent/LocalExecutor.js';
 
-export interface Message {
-    id: string;
-    role: 'user' | 'assistant' | 'system' | 'tool';
-    content: string | null;
-    tool_calls?: any[];
-    tool_call_id?: string;
-    name?: string;
-}
-
-export interface PendingToolCall {
-    tool_call_id: string;
-    name: string;
-    arguments: any;
-}
+import { Message, PendingToolCall } from '../../types/index.js';
+import { truncateForRAM, pruneHistoryByChars } from '../../utils/memory.js';
 
 // --- SHADOW PERSISTENCE LAYER ---
 let shadowMessages: Message[] = [{ id: 'welcome', role: 'system', name: 'welcome_msg', content: '' }];
@@ -31,36 +20,8 @@ let shadowAllowedTools: string[] = [];
 let shadowHistory: string[] = [];
 
 // --- LIMITS ---
-const MAX_CONTENT_LENGTH = 50000;
-const MAX_HISTORY_CHARS = 100000;
-// [FIX 1] NAIKKAN HARD LIMIT DARI 20 KE 50
-const ITERATION_SOFT_LIMIT = 50; 
-
-function truncateForRAM(content: string | null): string | null {
-    if (!content) return content;
-    if (content.length > MAX_CONTENT_LENGTH) {
-        return content.slice(0, MAX_CONTENT_LENGTH) + "\n\n... [ TRUNCATED AT 50KB FOR EXTREME RAM STABILITY ] ...";
-    }
-    return content;
-}
-
-function pruneHistoryByChars(messages: Message[]): Message[] {
-    let totalChars = 0;
-    const result: Message[] = [];
-    for (let i = messages.length - 1; i >= 0; i--) {
-        const m = messages[i];
-        const mChars = (m.content?.length || 0) + (JSON.stringify(m.tool_calls || []).length);
-        if (totalChars + mChars > MAX_HISTORY_CHARS) {
-            if (m.role === 'user' && i === messages.findIndex(msg => msg.role === 'user')) {
-                result.unshift(m);
-            }
-            break;
-        }
-        result.unshift(m);
-        totalChars += mChars;
-    }
-    return result;
-}
+// --- LIMITS ---
+// ITERATION_SOFT_LIMIT is now handled in LocalExecutor
 
 export function useChat() {
     const config = getGenericConfig();
@@ -96,6 +57,16 @@ export function useChat() {
         allowedToolsRef.current = allowedToolsForSession;
     }, [allowedToolsForSession]);
 
+    // --- UPDATE CHECKER ---
+    useEffect(() => {
+        // Mock update check
+        if (Math.random() > 0.8) { // 20% chance to show update
+            setTimeout(() => {
+                setMessages(prev => [...prev, { id: 'sys-update-' + Date.now(), role: 'system', content: '[NOTICE] A new version of VoidEx CLI is available! Run `git pull` to update.' }]);
+            }, 3000);
+        }
+    }, []);
+
     const approvalResolver = useRef<((choice: 'allow' | 'deny' | 'always') => void) | null>(null);
 
     const getSovereignPrompt = useCallback(() => {
@@ -116,6 +87,22 @@ ${sysContext}
 
     const abortController = useRef<AbortController | null>(null);
 
+    // --- AUTO-SAVE ---
+    useEffect(() => {
+        const timeout = setTimeout(() => {
+            if (messages.length > 2) { // Don't save empty/welcome chats
+                try {
+                    saveChat('autosave', messages);
+                } catch (e) {
+                    // silent fail
+                }
+            }
+        }, 2000); // Debounce 2s
+        return () => clearTimeout(timeout);
+    }, [messages]);
+
+    const executorRef = useRef<LocalExecutor>(new LocalExecutor());
+
     const stopLoading = useCallback(() => {
         if (abortController.current) {
             abortController.current.abort();
@@ -130,330 +117,8 @@ ${sysContext}
         setAgentStatus(null);
     }, []);
 
-    const processStream = async (stream: any, currentMessages: Message[], client: any, config: any, iterationCount: number, signal: AbortSignal, requestId: number) => {
-        
-        // [FIX 2] SOFT STOP (Konfirmasi User) alih-alih Error Mati
-        if (iterationCount >= ITERATION_SOFT_LIMIT) {
-            if (requestId === currentRequestIdRef.current) {
-                setAgentStatus(null); // Stop spinner
-                
-                // Minta izin user untuk melanjutkan
-                setPendingApproval({
-                    tool_call_id: 'sys-limit-' + Date.now(),
-                    name: 'CONTINUE_LONG_TASK', 
-                    arguments: { reason: `Safety limit (${ITERATION_SOFT_LIMIT} steps) reached. Continue?` }
-                });
+    // processStream has been refactored into LocalExecutor
 
-                const choice = await new Promise<'allow' | 'deny' | 'always'>((resolve) => {
-                    approvalResolver.current = resolve;
-                });
-
-                setPendingApproval(null);
-                approvalResolver.current = null;
-
-                if (choice === 'deny') {
-                    setMessages(prev => [...prev, {
-                        id: 'sys-stop-' + Date.now(),
-                        role: 'system',
-                        content: '[STOPPED] User chose to stop the agent after safety limit.'
-                    }]);
-                    setIsLoading(false);
-                    return;
-                }
-                
-                // Jika Allow/Always, RESET counter jadi 0 biar bisa lanjut 50 langkah lagi
-                iterationCount = 0;
-            }
-        }
-
-        const assistantMsg: Message = {
-            id: 'assistant-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
-            role: 'assistant',
-            content: '',
-            tool_calls: []
-        };
-
-        // Add placeholder immediately
-        setMessages((prev) => [...prev, assistantMsg]);
-
-        let toolCallsBuffer: any[] = [];
-        let lastUpdate = 0;
-        const UPDATE_INTERVAL = 100;
-
-        try {
-            for await (const chunk of stream) {
-                const delta = chunk.choices[0]?.delta;
-
-                if (delta?.content) {
-                    assistantMsg.content = (assistantMsg.content || '') + delta.content;
-
-                    if ((assistantMsg.content?.length || 0) > MAX_CONTENT_LENGTH) {
-                        assistantMsg.content = truncateForRAM(assistantMsg.content);
-                    }
-
-                    const now = Date.now();
-                    const isTTY = process.stdout.isTTY;
-
-                    if (isTTY && (now - lastUpdate > UPDATE_INTERVAL)) {
-                        if (requestId === currentRequestIdRef.current) {
-                            setMessages((prev) => {
-                                const newMsgs = [...prev];
-                                newMsgs[newMsgs.length - 1] = { ...assistantMsg };
-                                return newMsgs;
-                            });
-                        }
-                        lastUpdate = now;
-                    }
-                }
-
-                if (delta?.tool_calls) {
-                    const tcChunk = delta.tool_calls;
-                    for (const tc of tcChunk) {
-                        if (tc.index !== undefined) {
-                            if (!toolCallsBuffer[tc.index]) {
-                                toolCallsBuffer[tc.index] = { id: tc.id, type: tc.type, function: { name: tc.function?.name || '', arguments: '' } };
-                            }
-                            if (tc.id) toolCallsBuffer[tc.index].id = tc.id;
-                            if (tc.function?.name) toolCallsBuffer[tc.index].function.name = tc.function.name;
-                            if (tc.function?.arguments) toolCallsBuffer[tc.index].function.arguments += tc.function.arguments;
-                        }
-                    }
-                }
-            }
-        } catch (e: any) {
-            if (e.name === 'AbortError') return;
-            throw e;
-        }
-
-        if (requestId === currentRequestIdRef.current) {
-            setMessages((prev) => {
-                const newMsgs = [...prev];
-                // [FIX 4] Empty Bubble Fix: Kalau konten kosong dan gak ada tool, jangan update (atau bisa dihapus)
-                // Tapi kita keep logic standar, hanya pastikan update terakhir masuk.
-                newMsgs[newMsgs.length - 1] = { ...assistantMsg };
-                return newMsgs;
-            });
-        }
-
-        if (toolCallsBuffer.length > 0) {
-            assistantMsg.tool_calls = toolCallsBuffer;
-            setMessages((prev) => {
-                const newMsgs = [...prev];
-                newMsgs[newMsgs.length - 1] = { ...assistantMsg };
-                return newMsgs;
-            });
-
-            try {
-                const toolMessages: Message[] = [];
-                for (const tc of assistantMsg.tool_calls || []) {
-                    const toolName = tc.function.name;
-                    let args: any = {};
-                    try {
-                        args = JSON.parse(tc.function.arguments || '{}');
-                    } catch (e) {
-                        const errOutput = `[ERROR] Invalid JSON arguments for tool ${toolName}: ${tc.function.arguments}`;
-                        toolMessages.push({ id: 'tool-err-' + Date.now(), role: 'tool', tool_call_id: tc.id, name: toolName, content: errOutput });
-                        continue;
-                    }
-
-                    const needsApproval = ['write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash'].includes(toolName);
-                    const isWhitelisted = allowedToolsRef.current.includes(toolName);
-
-                    let proceed = true;
-                    if (needsApproval && !isWhitelisted) {
-                        setAgentStatus(null);
-                        setPendingApproval({ tool_call_id: tc.id, name: toolName, arguments: args });
-
-                        const choice = await new Promise<'allow' | 'deny' | 'always'>((resolve) => {
-                            approvalResolver.current = resolve;
-                        });
-
-                        setPendingApproval(null);
-                        approvalResolver.current = null;
-
-                        if (choice === 'deny') {
-                            const denyMsg: Message = {
-                                id: 'tool-deny-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
-                                role: 'tool',
-                                tool_call_id: tc.id,
-                                name: toolName,
-                                content: 'User denied this operation.'
-                            };
-                            toolMessages.push(denyMsg);
-                            setMessages(prev => [...prev, denyMsg]);
-                            proceed = false;
-                        } else if (choice === 'always') {
-                            setAllowedToolsForSession(prev => [...prev, toolName]);
-                        }
-                    }
-
-                    if (proceed) {
-                        try {
-                            setAgentStatus(`Executing ${toolName}...`);
-                            const toolFunc = toolRegistry[toolName as keyof typeof toolRegistry];
-
-                            if (toolFunc) {
-                                if (['read_file', 'write_file', 'replace'].includes(toolName) && typeof args.path !== 'string') {
-                                    throw new Error(`Missing required 'path' argument (string) for ${toolName}`);
-                                }
-
-                                let streamBuffer = '';
-                                let lastStreamUpdate = 0;
-
-                                const result = await toolFunc({
-                                    ...args,
-                                    onOutput: (chunk: string) => {
-                                        streamBuffer += chunk;
-                                        const now = Date.now();
-                                        if (chunk.includes('\n') || (now - lastStreamUpdate > 50)) {
-                                            const pending = streamBuffer;
-                                            streamBuffer = '';
-                                            lastStreamUpdate = now;
-                                            setLiveToolOutput(prev => {
-                                                const combined = prev + pending;
-                                                const lines = combined.split('\n');
-                                                if (lines.length > 20) {
-                                                    return lines.slice(-20).join('\n');
-                                                }
-                                                return combined;
-                                            });
-                                        }
-                                    }
-                                });
-
-                                if (streamBuffer) {
-                                    setLiveToolOutput(prev => {
-                                        const lines = (prev + streamBuffer).split('\n');
-                                        return lines.length > 20 ? lines.slice(-20).join('\n') : lines.join('\n');
-                                    });
-                                }
-
-                                await new Promise(r => setTimeout(r, 800));
-                                setLiveToolOutput('');
-
-                                const safeOutput = truncateForRAM(result.output);
-                                const resMsg: Message = {
-                                    id: 'tool-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7),
-                                    role: 'tool',
-                                    tool_call_id: tc.id,
-                                    name: toolName,
-                                    content: safeOutput
-                                };
-                                toolMessages.push(resMsg);
-                                setMessages(prev => [...prev, resMsg]);
-
-                                if (result.isError) break;
-                            } else {
-                                throw new Error(`Tool ${toolName} not found`);
-                            }
-                        } catch (err: any) {
-                            const errorMsg: Message = {
-                                id: 'tool-err-' + Date.now(),
-                                role: 'tool',
-                                tool_call_id: tc.id,
-                                name: toolName,
-                                content: `[TOOL CRASH] ${err.message}`
-                            };
-                            toolMessages.push(errorMsg);
-                            setMessages(prev => [...prev, errorMsg]);
-                            break;
-                        }
-                    }
-                }
-
-                let needsHeal = false;
-                let healPrompt = "";
-                for (const tm of toolMessages) {
-                    const output = tm.content?.toLowerCase() || "";
-                    if (output.includes("command not found") || output.includes("is not installed")) {
-                        needsHeal = true;
-                        healPrompt = `CMD FAILED: The output says the command is missing. Use the PACKAGE_MANAGER from system context to install it, then try the task again. Output: ${output}`;
-                        break;
-                    }
-                }
-
-                setAgentStatus(needsHeal ? 'Auto-Healing...' : 'Analyzing result...');
-
-                const nextMessages = [...currentMessages, assistantMsg, ...toolMessages];
-                if (needsHeal) {
-                    nextMessages.push({ id: Date.now().toString() + 'heal', role: 'user', content: healPrompt });
-                }
-
-                await new Promise(resolve => setTimeout(resolve, 1000));
-
-                const firstUserIdx = nextMessages.findIndex(m => m.role === 'user');
-                const firstUserMsg = firstUserIdx !== -1 ? nextMessages[firstUserIdx] : null;
-
-                let recentMessages = pruneHistoryByChars(nextMessages);
-
-                if (firstUserMsg && !recentMessages.find(m => m.id === firstUserMsg.id)) {
-                    recentMessages = [firstUserMsg, ...recentMessages];
-                }
-
-                if (!abortController.current) return;
-
-                // [FIX 3] SMART LOOP DETECTION
-                // Cek apakah 3 perintah terakhir SAMA PERSIS. Kalau variatif, biarkan lewat.
-                const assistants = nextMessages.filter(m => m.role === 'assistant');
-                if (assistants.length >= 3) {
-                    const getAction = (m: Message) => {
-                        if (!m.tool_calls || m.tool_calls.length === 0) return null;
-                        // Compare entire function object (name + arguments)
-                        return JSON.stringify(m.tool_calls[0].function);
-                    };
-
-                    const historyToAudit = assistants.slice(-3); // Cek 3 terakhir
-                    const lastAction = getAction(historyToAudit[historyToAudit.length - 1]);
-                    
-                    // Validasi: Apakah ketiganya punya aksi yang SAMA PERSIS?
-                    const isRepetitive = historyToAudit.every(m => getAction(m) === lastAction && lastAction !== null);
-
-                    if (isRepetitive) {
-                        setError("Sovereign Loop Detected: Agent stuck executing exact same command 3x. Use /forget to reset.");
-                        setIsLoading(false);
-                        return;
-                    }
-                }
-
-                // RECURSIVE CALL
-                if (toolCallsBuffer.length === 0 && !needsHeal) {
-                    setIsLoading(false);
-                    setAgentStatus(null);
-                    return;
-                }
-
-                const nextStream = await client.chat.completions.create({
-                    model: config.model,
-                    messages: [
-                        { role: 'system', content: getSovereignPrompt() },
-                        ...recentMessages
-                            .filter(m => (m.role !== 'assistant' || (m.content && m.content.trim()) || (m.tool_calls && m.tool_calls.length > 0)))
-                            .map(m => ({
-                                role: m.role,
-                                content: (m.content || '').trim(),
-                                tool_calls: m.tool_calls,
-                                tool_call_id: m.tool_call_id
-                            }))
-                    ],
-                    stream: true,
-                    tools: toolsDefinition as any,
-                }, { signal });
-                
-                // Increment counter hanya saat rekursi terjadi
-                await processStream(nextStream, nextMessages, client, config, iterationCount + 1, signal, requestId);
-            } catch (e: any) {
-                if (e.name === 'AbortError' || requestId !== currentRequestIdRef.current) return;
-                console.error("Stream processing error:", e);
-                if (e.message.includes('429')) {
-                    setError('Rate limit hit (429). Retrying...');
-                } else if (e.message.includes('context_length_exceeded')) {
-                    setError('Context limit exceeded. Use /clear.');
-                } else {
-                    setError(`Connection Error: ${e.message}`);
-                }
-            }
-        }
-    };
 
     const sendMessage = useCallback(async (rawContent: string) => {
         const content = rawContent.trim();
@@ -575,67 +240,39 @@ ${sysContext}
         setError(null);
         setAgentStatus('Thinking...');
 
-        const callWithRetry = async (fn: () => Promise<any>, retries = 3, delay = 2000): Promise<any> => {
-            try {
-                if (signal.aborted) throw new Error('AbortError');
-                return await fn();
-            } catch (err: any) {
-                if (signal.aborted) throw err;
-                if ((err.message.includes('429') || err.message.includes('fetch failed')) && retries > 0) {
-                    setAgentStatus(`Connection unstable. Retrying in ${delay / 1000}s... (${retries} left)`);
-                    await new Promise(res => setTimeout(res, delay));
-                    return callWithRetry(fn, retries - 1, delay * 2);
-                }
-                throw err;
-            }
-        };
-
         try {
-            const client = createClient(latestApiKey!);
-            const firstUserIdx = currentMsgs.findIndex(m => m.role === 'user');
-            const firstUserMsg = firstUserIdx !== -1 ? currentMsgs[firstUserIdx] : null;
-
-            const windowSize = 30;
-            let recentMessages = currentMsgs.slice(-windowSize);
-            if (firstUserMsg && !recentMessages.find(m => m.id === firstUserMsg.id)) {
-                recentMessages = [firstUserMsg, ...recentMessages];
-            }
-
-            const completionFn = () => client.chat.completions.create({
-                model: currentConfig.model,
-                messages: [
-                    { role: 'system', content: getSovereignPrompt() },
-                    ...recentMessages
-                        .filter(m => {
-                            if (m.role === 'system' && ['welcome_msg', 'help_menu', 'tools_list'].includes(m.name || '')) return false;
-                            if (m.role === 'assistant' && !m.content?.trim() && (!m.tool_calls || m.tool_calls.length === 0)) return false;
-                            return true;
-                        })
-                        .map(m => {
-                            const role = (m.role === 'system' || m.role === 'tool') ? m.role : m.role;
-                            const msg: any = { role, content: (m.content || '').trim() };
-                            if (m.role === 'assistant' && m.tool_calls) msg.tool_calls = m.tool_calls;
-                            if (m.role === 'tool') msg.tool_call_id = m.tool_call_id;
-                            return msg;
-                        })
-                ],
-                tools: toolsDefinition as any,
-                stream: true,
-            }, { signal });
-
-            const stream = await callWithRetry(completionFn);
-            if (requestId === currentRequestIdRef.current) {
-                await processStream(stream, currentMsgs, client, currentConfig, 0, signal, requestId);
-            }
+            await executorRef.current.run({
+                model: getGenericConfig().model,
+                apiKey: getApiKey() || currentApiKey!,
+                messages: currentMsgs,
+                onUpdateMessages: (msgs) => {
+                    if (requestId === currentRequestIdRef.current) setMessages(msgs);
+                },
+                onStatusUpdate: (status) => {
+                    if (requestId === currentRequestIdRef.current) setAgentStatus(status);
+                },
+                onLiveOutput: (output) => {
+                    setLiveToolOutput(output);
+                },
+                onNeedApproval: async (info) => {
+                    setPendingApproval(info);
+                    setAgentStatus(null);
+                    return new Promise<'allow' | 'deny' | 'always'>((resolve) => {
+                        approvalResolver.current = resolve;
+                    }).then(res => {
+                        setPendingApproval(null);
+                        approvalResolver.current = null;
+                        return res;
+                    });
+                },
+                onError: (err) => {
+                    if (requestId === currentRequestIdRef.current) setError(err);
+                },
+                signal
+            });
         } catch (err: any) {
-            if (err.name === 'AbortError' || requestId !== currentRequestIdRef.current) {
-                return;
-            } else if (err.message.includes('429')) {
-                setError('Rate limit consistently hit (429). Try again later.');
-            } else if (err.message.includes('context_length_exceeded')) {
-                setError('Context limit exceeded. Use /clear to start fresh.');
-            } else {
-                setError(`Error: ${err.message || 'Unknown network error'}`);
+            if (requestId === currentRequestIdRef.current) {
+                setError(err.message || 'Unknown error');
             }
         } finally {
             if (requestId === currentRequestIdRef.current) {

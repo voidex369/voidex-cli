@@ -5,12 +5,20 @@ import BigText from 'ink-big-text';
 import { getApiKey, saveConfig } from '../lib/config.js';
 import TextInput from 'ink-text-input';
 import Chat from './components/Chat.js';
+import { KeypressProvider } from './contexts/KeypressContext.js';
+import { MouseProvider } from './contexts/MouseContext.js';
+import { ScrollProvider } from './contexts/ScrollProvider.js';
+import { useAlternateBuffer } from './hooks/useAlternateBuffer.js';
+import { ThemeProvider } from './contexts/ThemeContext.js';
 
 type View = 'welcome' | 'chat' | 'auth';
 
 export default function App() {
     const [view, setView] = useState<View>('welcome');
     const [apiKey, setApiKey] = useState('');
+
+    // Enable alternate buffer only when we are in the main 'chat' view to keep clean transitions
+    useAlternateBuffer(view === 'chat');
 
     useEffect(() => {
         // Simple View Logic
@@ -56,8 +64,16 @@ export default function App() {
     }
 
     return (
-        <Box flexDirection="column" height="100%">
-            <Chat />
-        </Box>
+        <KeypressProvider>
+            <MouseProvider mouseEventsEnabled={true}>
+                <ThemeProvider>
+                    <ScrollProvider>
+                        <Box flexDirection="column" height="100%">
+                            <Chat />
+                        </Box>
+                    </ScrollProvider>
+                </ThemeProvider>
+            </MouseProvider>
+        </KeypressProvider>
     );
 }

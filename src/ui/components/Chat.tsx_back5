@@ -262,15 +262,15 @@ const StatusArea = React.memo(({ agentStatus, liveToolOutput, pendingApproval, a
     }, [liveToolOutput]);
 
     return (
-        <Box flexDirection="column" flexShrink={0}>
+        <Box flexDirection="column" flexShrink={0} marginBottom={1}>
             {agentStatus && (
-                <Box borderStyle="single" borderColor="yellow" paddingX={1} marginBottom={1} flexDirection="column">
+                <Box borderStyle="single" borderColor="yellow" paddingX={1} flexDirection="column">
                     <Box><Text color="yellow">⏳</Text><Text> {agentStatus}</Text></Box>
                     {cappedOutput && <Box marginTop={1} paddingX={1} borderStyle="single" borderColor="gray"><Text color="gray">{cappedOutput}</Text></Box>}
                 </Box>
             )}
             {pendingApproval && (
-                <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1} marginBottom={1}>
+                <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
                     <Text bold color="yellow">⚠ Safety Check: {pendingApproval.name}</Text>
                     <Box flexDirection="column" marginTop={1}>
                         {approvalOptions.map((opt: any, i: number) => (
@@ -311,7 +311,6 @@ const InputArea = React.memo(({ input, setInput, handleSend, suggestions, select
 const HistoryViewport = React.memo(({ staticMessages, activeMessage }: any) => {
     return (
         <Box flexDirection="column" width="100%" flexGrow={1} flexShrink={1}>
-            {/* Static History */}
             <Static items={staticMessages}>
                 {(msg: any) => (
                     <Box key={msg.id} width="100%">
@@ -320,7 +319,6 @@ const HistoryViewport = React.memo(({ staticMessages, activeMessage }: any) => {
                 )}
             </Static>
 
-            {/* Active / Streaming Message */}
             {activeMessage && (
                 <Box width="100%" paddingX={1} marginBottom={1}>
                     <MessageItem msg={activeMessage} />
@@ -330,7 +328,6 @@ const HistoryViewport = React.memo(({ staticMessages, activeMessage }: any) => {
     );
 });
 
-// --- Isolated Chat View ---
 const ChatView = React.memo(({ onDialog, chatState }: any) => {
     const {
         messages, isLoading, error, sendMessage, agentStatus, stopLoading,
@@ -351,11 +348,10 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
     const isTTY = process.stdout.isTTY;
 
     const lastMsg = messages[messages.length - 1];
-    
-    // Status 'Thinking...' artinya AI sedang streaming argumen/teks. Ini saatnya dia AKTIF.
     const isThinking = agentStatus === 'Thinking...';
-
-    // Logic "Active" diperketat untuk menghindari flickering
+    
+    // Logic: Only assistant in 'thinking' mode is Active.
+    // Tool calls and results become static immediately.
     const shouldKeepActive = isTTY && lastMsg?.role === 'assistant' && (!lastMsg.tool_calls?.length || isThinking);
 
     const { staticMessages, activeMessage } = useMemo(() => {
@@ -509,22 +505,21 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
     return (
         <Box flexDirection="column" width="100%">
             <HistoryViewport staticMessages={staticMessages} activeMessage={activeMessage} />
-            
-            {/* [FIX] REMOVED OUTER BORDER to prevent "reprinting" glitch */}
-            {/* Box ini sekarang hanya wrapper tanpa border, sehingga aman saat child-nya update cepat */}
-            <Box flexDirection="column" marginTop={1} paddingTop={1} flexGrow={0} flexShrink={0}>
+
+            {/* [FIX] REMOVED OUTER BORDER to fix looping glitch on rapid updates */}
+            <Box flexDirection="column" marginTop={0} flexGrow={0} flexShrink={0}>
                 
-                {showExitNotice && <Box marginLeft={1} marginBottom={1}><Text color="yellow" bold>⚠ Press Ctrl+C again to exit</Text></Box>}
-                {error && <Text color="red" bold>✖ Error: {error}</Text>}
-                
-                {hasMemory && (
-                    <Box marginLeft={1} marginBottom={1}>
-                        <Text dimColor italic>Sovereign memory active</Text>
-                    </Box>
-                )}
-                
+                {/* Meta Info Area */}
+                <Box flexDirection="column" paddingX={1} marginBottom={0}>
+                    {showExitNotice && <Text color="yellow" bold>⚠ Press Ctrl+C again to exit</Text>}
+                    {error && <Text color="red" bold>✖ Error: {error}</Text>}
+                    {hasMemory && <Text dimColor italic>Sovereign memory active</Text>}
+                </Box>
+
+                {/* Live Status */}
                 {isTTY && <StatusArea agentStatus={agentStatus} liveToolOutput={liveToolOutput} pendingApproval={pendingApproval} approvalOptions={apprOpts} approvalIndex={apprIdx} />}
                 
+                {/* Input Area */}
                 <InputArea input={input} setInput={setInput} handleSend={handleSend} suggestions={suggestions} selectedIndex={selIdx} />
             </Box>
         </Box>
