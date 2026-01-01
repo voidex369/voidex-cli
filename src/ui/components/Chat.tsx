@@ -1,12 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Box, Text, useInput, useApp, Static } from 'ink';
 import TextInput from 'ink-text-input';
-// import Spinner from 'ink-spinner'; // Disabled to prevent render loop
 import Gradient from 'ink-gradient';
 import { useChat, Message } from '../hooks/useChat.js';
 import { getAvailableModels, saveModel, saveApiKey, getApiKey, getModelDisplayName } from '../../lib/config.js';
 
-// --- Sub-components (Memoized for Extreme Stability) ---
+// --- Sub-components (Memoized for Stability) ---
 
 const HelpMenu = React.memo(() => (
     <Box flexDirection="column" borderStyle="double" borderColor="cyan" padding={1} marginBottom={1}>
@@ -110,17 +109,19 @@ const TruncatedResultBox = React.memo(({ content, isSuccess }: { content: string
 
 
 const MessageItem = React.memo(({ msg }: { msg: Message }) => {
+    const boxProps = { flexDirection: "column" as const, marginBottom: 1, flexShrink: 0 };
+
     if (msg.role === 'system') {
         if (msg.name === 'welcome_msg') return <WelcomeBox />;
         if (msg.name === 'help_menu') return <HelpMenu />;
         if (msg.name === 'tools_list') return <ToolsList content={msg.content || ''} />;
-        return <Box paddingX={1} marginBottom={1}><Text color="gray" italic>✦ {msg.content}</Text></Box>;
+        return <Box paddingX={1} marginBottom={1} flexShrink={0}><Text color="gray" italic>✦ {msg.content}</Text></Box>;
     }
 
     if (msg.role === 'tool') {
         const isSuccess = !msg.content?.toLowerCase().includes('error') && !msg.content?.toLowerCase().includes('failed');
         return (
-            <Box flexDirection="column" marginLeft={2} marginBottom={1} borderStyle="round" borderColor={isSuccess ? 'green' : 'red'} paddingX={1}>
+            <Box {...boxProps} marginLeft={2} borderStyle="round" borderColor={isSuccess ? 'green' : 'red'} paddingX={1}>
                 <Text bold color={isSuccess ? 'green' : 'red'}>{isSuccess ? '✓' : '✖'} Tool Result:</Text>
                 <TruncatedResultBox content={msg.content || ''} isSuccess={isSuccess} />
             </Box>
@@ -130,7 +131,7 @@ const MessageItem = React.memo(({ msg }: { msg: Message }) => {
     if (msg.role === 'assistant') {
         const hasTools = msg.tool_calls && msg.tool_calls.length > 0;
         return (
-            <Box flexDirection="column" marginBottom={1}>
+            <Box {...boxProps}>
                 <Text bold color="magenta">Agent:</Text>
                 {msg.content && (
                     <Box paddingLeft={2} marginBottom={hasTools ? 1 : 0}>
@@ -162,9 +163,8 @@ const MessageItem = React.memo(({ msg }: { msg: Message }) => {
         );
     }
 
-    // [MODIFIED] USER MESSAGE - BUBBLE STYLE
     return (
-        <Box flexDirection="column" marginBottom={1} borderStyle="round" borderColor="blue" paddingX={1}>
+        <Box {...boxProps} borderStyle="round" borderColor="blue" paddingX={1}>
             <Text bold color="blue">👤 You:</Text>
             <Text>{msg.content}</Text>
         </Box>
@@ -262,15 +262,15 @@ const StatusArea = React.memo(({ agentStatus, liveToolOutput, pendingApproval, a
     }, [liveToolOutput]);
 
     return (
-        <Box flexDirection="column" flexShrink={0}>
+        <Box flexDirection="column" flexShrink={0} marginBottom={1}>
             {agentStatus && (
-                <Box borderStyle="single" borderColor="yellow" paddingX={1} marginBottom={1} flexDirection="column">
+                <Box borderStyle="single" borderColor="yellow" paddingX={1} flexDirection="column">
                     <Box><Text color="yellow">⏳</Text><Text> {agentStatus}</Text></Box>
                     {cappedOutput && <Box marginTop={1} paddingX={1} borderStyle="single" borderColor="gray"><Text color="gray">{cappedOutput}</Text></Box>}
                 </Box>
             )}
             {pendingApproval && (
-                <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1} marginBottom={1}>
+                <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
                     <Text bold color="yellow">⚠ Safety Check: {pendingApproval.name}</Text>
                     <Box flexDirection="column" marginTop={1}>
                         {approvalOptions.map((opt: any, i: number) => (
@@ -285,7 +285,6 @@ const StatusArea = React.memo(({ agentStatus, liveToolOutput, pendingApproval, a
     );
 });
 
-// [FIX] STRICT LAYOUT ISOLATION FOR INPUT
 const InputArea = React.memo(({ input, setInput, handleSend, suggestions, selectedIndex }: any) => (
     <Box flexDirection="column" flexShrink={0} flexGrow={0}>
         {suggestions.length > 0 && (
@@ -302,7 +301,6 @@ const InputArea = React.memo(({ input, setInput, handleSend, suggestions, select
         )}
         <Box borderStyle="single" borderColor="green" paddingX={1}>
             <Box marginRight={1}><Text bold color="green">❯</Text></Box>
-            {/* [FIX] HARDCODED HEIGHT untuk mencegah Backspace Jitter */}
             <Box flexGrow={1} height={1} minHeight={1}>
                 <TextInput value={input} onChange={setInput} onSubmit={handleSend} placeholder="Type or / for commands..." />
             </Box>
@@ -310,11 +308,9 @@ const InputArea = React.memo(({ input, setInput, handleSend, suggestions, select
     </Box>
 ));
 
-// [FIX] COMPONENT SEPARATION (History vs Input)
 const HistoryViewport = React.memo(({ staticMessages, activeMessage }: any) => {
     return (
         <Box flexDirection="column" width="100%" flexGrow={1} flexShrink={1}>
-            {/* Static History */}
             <Static items={staticMessages}>
                 {(msg: any) => (
                     <Box key={msg.id} width="100%">
@@ -323,7 +319,6 @@ const HistoryViewport = React.memo(({ staticMessages, activeMessage }: any) => {
                 )}
             </Static>
 
-            {/* Active / Streaming Message */}
             {activeMessage && (
                 <Box width="100%" paddingX={1} marginBottom={1}>
                     <MessageItem msg={activeMessage} />
@@ -333,7 +328,6 @@ const HistoryViewport = React.memo(({ staticMessages, activeMessage }: any) => {
     );
 });
 
-// --- Isolated Chat View ---
 const ChatView = React.memo(({ onDialog, chatState }: any) => {
     const {
         messages, isLoading, error, sendMessage, agentStatus, stopLoading,
@@ -352,10 +346,13 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
     const [showExitNotice, setShowExitNotice] = useState(false);
 
     const isTTY = process.stdout.isTTY;
-    const prevStaticRef = useRef<Message[]>([]);
 
-    const isLastMessageAssistant = messages.length > 0 && messages[messages.length - 1].role === 'assistant';
-    const shouldKeepActive = isTTY && (isLoading || isLastMessageAssistant);
+    const lastMsg = messages[messages.length - 1];
+    const isThinking = agentStatus === 'Thinking...';
+    
+    // Logic: Only assistant in 'thinking' mode is Active.
+    // Tool calls and results become static immediately.
+    const shouldKeepActive = isTTY && lastMsg?.role === 'assistant' && (!lastMsg.tool_calls?.length || isThinking);
 
     const { staticMessages, activeMessage } = useMemo(() => {
         const RENDER_WINDOW = 150;
@@ -370,15 +367,6 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
         } else {
             staticMsgs = windowed;
             activeMsg = null;
-        }
-
-        if (
-            staticMsgs.length === prevStaticRef.current.length &&
-            staticMsgs.every((m, i) => m === prevStaticRef.current[i])
-        ) {
-            staticMsgs = prevStaticRef.current;
-        } else {
-            prevStaticRef.current = staticMsgs;
         }
 
         return { staticMessages: staticMsgs, activeMessage: activeMsg };
@@ -516,17 +504,22 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
 
     return (
         <Box flexDirection="column" width="100%">
-            {/* History Viewport (Isolated) */}
             <HistoryViewport staticMessages={staticMessages} activeMessage={activeMessage} />
 
-            {/* Footer Area: Locked Layout */}
-            <Box flexDirection="column" marginTop={1} borderStyle="single" borderColor="gray" paddingTop={1} flexGrow={0} flexShrink={0}>
-                {showExitNotice && <Box marginLeft={1} marginBottom={1}><Text color="yellow" bold>⚠ Press Ctrl+C again to exit</Text></Box>}
-                {error && <Text color="red" bold>✖ Error: {error}</Text>}
-                {hasMemory && <Box marginLeft={1} marginBottom={1}><Text dimColor italic>Sovereign memory active</Text></Box>}
+            {/* [FIX] REMOVED OUTER BORDER to fix looping glitch on rapid updates */}
+            <Box flexDirection="column" marginTop={0} flexGrow={0} flexShrink={0}>
+                
+                {/* Meta Info Area */}
+                <Box flexDirection="column" paddingX={1} marginBottom={0}>
+                    {showExitNotice && <Text color="yellow" bold>⚠ Press Ctrl+C again to exit</Text>}
+                    {error && <Text color="red" bold>✖ Error: {error}</Text>}
+                    {hasMemory && <Text dimColor italic>Sovereign memory active</Text>}
+                </Box>
+
+                {/* Live Status */}
                 {isTTY && <StatusArea agentStatus={agentStatus} liveToolOutput={liveToolOutput} pendingApproval={pendingApproval} approvalOptions={apprOpts} approvalIndex={apprIdx} />}
                 
-                {/* Input Area (Strictly Isolated) */}
+                {/* Input Area */}
                 <InputArea input={input} setInput={setInput} handleSend={handleSend} suggestions={suggestions} selectedIndex={selIdx} />
             </Box>
         </Box>
