@@ -12,7 +12,7 @@
     "dev": "tsx src/cli.tsx",
     "start": "node dist/cli.js",
     "prepublishOnly": "npm run build",
-    "test": "echo \"Test berhasil dilewati (belum ada test).\" && exit 0"
+    "test": "vitest run"
   },
   "dependencies": {
     "dotenv": "^16.4.5",

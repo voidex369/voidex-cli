@@ -45,7 +45,9 @@ export class LocalExecutor {
             // Safety limit check
             if (this.iterationCount >= this.maxIterations) {
                 state = 'WAITING_APPROVAL';
-                onStatusUpdate(null);
+                // [FIX] Kirim status teks agar UI tidak mengunci ke Static
+                onStatusUpdate('Safety Limit Reached. Waiting approval...');
+
                 const approval = await onNeedApproval({
                     tool_call_id: 'sys-limit-' + Date.now(),
                     name: 'CONTINUE_LONG_TASK',
@@ -71,7 +73,6 @@ export class LocalExecutor {
                     const systemContext = getSystemContext();
                     const recentMessages = pruneHistoryByChars(currentMessages);
 
-                    // Filter messages for API
                     const apiMessages = [
                         { role: 'system', content: this.getSystemPrompt(systemContext) },
                         ...recentMessages
@@ -93,7 +94,7 @@ export class LocalExecutor {
 
                     // -- Streaming Logic --
                     let assistantMsg: Message = {
-                        id: 'assistant-' + Date.now(),
+                        id: 'assistant-' + Date.now(), // Stable ID
                         role: 'assistant',
                         content: '',
                         tool_calls: []
@@ -105,55 +106,52 @@ export class LocalExecutor {
 
                     for await (const chunk of stream) {
                         const delta = chunk.choices[0]?.delta;
+                        const now = Date.now();
+                        let hasChanges = false;
+
+                        // 1. Content Updates
                         if (delta?.content) {
                             assistantMsg.content = (assistantMsg.content || '') + delta.content;
-
-                            if (!isAddedToHistory) {
-                                currentMessages.push(assistantMsg);
-                                isAddedToHistory = true;
-                                onUpdateMessages([...currentMessages]);
-                            }
-
                             if (assistantMsg.content.length > 50000) {
                                 assistantMsg.content = truncateForRAM(assistantMsg.content);
                             }
-                            const now = Date.now();
-                            const hasNewline = delta.content.includes('\n');
-                            if (hasNewline || (now - lastUpdate > 30)) {
-                                if (isAddedToHistory) {
-                                    currentMessages[currentMessages.length - 1] = { ...assistantMsg };
-                                    onUpdateMessages([...currentMessages]);
-                                }
-                                lastUpdate = now;
-                            }
+                            hasChanges = true;
                         }
-                        if (delta?.tool_calls) {
-                            if (!isAddedToHistory) {
-                                currentMessages.push(assistantMsg);
-                                isAddedToHistory = true;
-                                onUpdateMessages([...currentMessages]);
-                            }
 
+                        // 2. Tool Call Updates
+                        if (delta?.tool_calls) {
                             for (const tc of delta.tool_calls) {
                                 if (tc.index !== undefined) {
                                     if (!toolCallsBuffer[tc.index]) toolCallsBuffer[tc.index] = { id: tc.id, type: tc.type, function: { name: '', arguments: '' } };
                                     if (tc.id) toolCallsBuffer[tc.index].id = tc.id;
                                     if (tc.function?.name) toolCallsBuffer[tc.index].function.name += tc.function.name;
                                     if (tc.function?.arguments) toolCallsBuffer[tc.index].function.arguments += tc.function.arguments;
+                                }
+                            }
+                            assistantMsg.tool_calls = [...toolCallsBuffer];
+                            hasChanges = true;
+                        }
 
-                                    if (isAddedToHistory) {
-                                        assistantMsg.tool_calls = [...toolCallsBuffer];
-                                        currentMessages[currentMessages.length - 1] = { ...assistantMsg };
-                                        onUpdateMessages([...currentMessages]);
-                                    }
+                        // [FIX] THROTTLE 150ms untuk stabilitas terminal
+                        if (hasChanges) {
+                            if (!isAddedToHistory) {
+                                currentMessages.push(assistantMsg);
+                                isAddedToHistory = true;
+                                onUpdateMessages([...currentMessages]);
+                                lastUpdate = now;
+                            } else {
+                                if (now - lastUpdate > 150) {
+                                    currentMessages[currentMessages.length - 1] = { ...assistantMsg };
+                                    onUpdateMessages([...currentMessages]);
+                                    lastUpdate = now;
                                 }
                             }
                         }
                     }
 
-                    // Final update for this turn
+                    // Final flush
                     if (isAddedToHistory) {
-                        assistantMsg.tool_calls = toolCallsBuffer.length > 0 ? toolCallsBuffer : undefined;
+                        if (toolCallsBuffer.length > 0) assistantMsg.tool_calls = toolCallsBuffer;
                         currentMessages[currentMessages.length - 1] = { ...assistantMsg };
                         onUpdateMessages([...currentMessages]);
                     }
@@ -161,7 +159,7 @@ export class LocalExecutor {
                     if (toolCallsBuffer.length > 0) {
                         state = 'EXECUTING_TOOLS';
                     } else {
-                        state = 'DONE'; // No tools driven, Agent finished turn
+                        state = 'DONE';
                     }
 
                 } catch (e: any) {
@@ -177,9 +175,8 @@ export class LocalExecutor {
                     continue;
                 }
 
-                // Loop Detection
                 if (this.detectLoop(currentMessages)) {
-                    await this.sleep(1000); // UI delay
+                    await this.sleep(1000);
                     onError("Loop Detected: Agent repeating actions. Stopping.");
                     state = 'ERROR';
                     continue;
@@ -189,7 +186,6 @@ export class LocalExecutor {
                 let needsHeal = false;
                 let healPrompt = "";
 
-                // Sensitivity List: Tools that REQUIRE approval
                 const SENSITIVE_TOOLS = [
                     'write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash', 'google_web_search', 'delegate_to_agent'
                 ];
@@ -204,9 +200,8 @@ export class LocalExecutor {
                         continue;
                     }
 
-                    // --- [SECURITY] Approval Logic ---
                     if (SENSITIVE_TOOLS.includes(toolName) && !currentAllowedTools.has(toolName)) {
-                        onStatusUpdate(null); // Pause status
+                        onStatusUpdate('Waiting for approval...');
                         const decision = await onNeedApproval({
                             tool_call_id: tc.id,
                             name: toolName,
@@ -214,28 +209,17 @@ export class LocalExecutor {
                         });
 
                         if (decision === 'deny') {
-                            toolMessages.push({
-                                id: 'tool-deny-' + Date.now(),
-                                role: 'tool',
-                                tool_call_id: tc.id,
-                                name: toolName,
-                                content: "[STOPPED] User denied permission to run this tool."
-                            });
+                            toolMessages.push({ id: 'tool-deny-' + Date.now(), role: 'tool', tool_call_id: tc.id, name: toolName, content: "[STOPPED] User denied permission." });
                             state = 'DONE';
                             break;
                         }
-
                         if (decision === 'always') {
                             currentAllowedTools.add(toolName);
                             params.onToolWhitelisted?.(toolName);
                         }
-                        // If 'allow', proceed below.
                     }
 
                     onStatusUpdate(`Executing ${toolName}...`);
-
-                    // Simple approval check mock
-                    // In real implementation we need to pass the allow list
 
                     try {
                         const toolFunc = toolRegistry[toolName as keyof typeof toolRegistry];
@@ -243,11 +227,10 @@ export class LocalExecutor {
 
                         const result = await toolFunc({
                             ...args,
-                            onOutput: (chunk: string) => onLiveOutput(chunk) // Stream output to UI
+                            onOutput: (chunk: string) => onLiveOutput(chunk)
                         });
 
-                        onLiveOutput(''); // Clear buffer
-
+                        onLiveOutput('');
                         toolMessages.push({
                             id: 'tool-' + Date.now() + Math.random(),
                             role: 'tool',
@@ -256,21 +239,12 @@ export class LocalExecutor {
                             content: truncateForRAM(result.output) || 'Done'
                         });
 
-                        if (result.isError) {
-                            if (result.output.toLowerCase().includes('command not found')) {
-                                needsHeal = true;
-                                healPrompt = `CMD FAILED: ${result.output}`;
-                            }
+                        if (result.isError && result.output.toLowerCase().includes('command not found')) {
+                            needsHeal = true;
+                            healPrompt = `CMD FAILED: ${result.output}`;
                         }
-
                     } catch (err: any) {
-                        toolMessages.push({
-                            id: 'tool-err-' + Date.now(),
-                            role: 'tool',
-                            tool_call_id: tc.id,
-                            name: toolName,
-                            content: `[TOOL CRASH] ${err.message}`
-                        });
+                        toolMessages.push({ id: 'tool-err-' + Date.now(), role: 'tool', tool_call_id: tc.id, name: toolName, content: `[TOOL CRASH] ${err.message}` });
                     }
                 }
 
@@ -283,12 +257,11 @@ export class LocalExecutor {
                         onUpdateMessages(currentMessages);
                         state = 'THINKING';
                     } else {
-                        state = 'THINKING'; // Continue thinking with tool results
+                        state = 'THINKING';
                     }
                 }
             }
         }
-
         onStatusUpdate(null);
     }
 
@@ -316,7 +289,6 @@ ${sysContext}
             const tools = (m.tool_calls || []).map(t => {
                 let args = t.function.arguments || '';
                 try {
-                    // Normalize JSON to prevent loops based on formatting
                     args = JSON.stringify(JSON.parse(args));
                 } catch (e) { /* ignore */ }
                 return `${t.function.name}:${args}`;
@@ -326,26 +298,15 @@ ${sysContext}
 
         const sigs = assistants.map(getSig);
         const last = sigs.length - 1;
-
-        // Pattern 1: A-A-A (Direct repeat)
         if (sigs[last] === sigs[last - 1] && sigs[last] === sigs[last - 2]) return true;
-
-        // Pattern 2: A-B-A-B (Oscillation)
         if (assistants.length >= 4) {
-            if (sigs[last] === sigs[last - 2] && sigs[last - 1] === sigs[last - 3]) {
-                // Ignore if it's just "Thinking..." or very short content without tools
-                // as that might be valid back-and-forth sometimes, but usually ABAB is a loop.
-                return true;
-            }
+            if (sigs[last] === sigs[last - 2] && sigs[last - 1] === sigs[last - 3]) return true;
         }
-
-        // Pattern 3: Empty Response Loop (Thinking but not acting)
         const recentAssistants = assistants.slice(-4);
         const allEmpty = recentAssistants.length >= 4 && recentAssistants.every(m =>
             (!m.content || !m.content.trim()) && (!m.tool_calls || m.tool_calls.length === 0)
         );
         if (allEmpty) return true;
-
         return false;
     }
 

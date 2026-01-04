@@ -146,7 +146,6 @@ export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
 
         return (
             <Box {...boxProps} width="100%">
-                {/* Only show header if there is something to follow, or if we want to show it's thinking */}
                 <Text bold color={theme.text.accent}>Agent:</Text>
                 {hasContent && (
                     <Box paddingLeft={1} marginBottom={hasTools ? 1 : 0} width="100%">
@@ -154,17 +153,13 @@ export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
                     </Box>
                 )}
                 {hasTools && msg.tool_calls!.map((tc: any, idx: number) => {
-                    let formattedArgs = tc.function.arguments;
-                    if (formattedArgs.length > 50) {
-                        try {
-                            const parsed = JSON.parse(tc.function.arguments);
-                            if (parsed.content && parsed.content.length > 100) {
-                                parsed.content = parsed.content.substring(0, 100) + '...';
-                            }
-                            formattedArgs = JSON.stringify(parsed, null, 2);
-                        } catch (e) {
-                            if (formattedArgs.length > 150) formattedArgs = formattedArgs.slice(0, 150) + '...';
-                        }
+                    // [FIX VISUAL LOOP]
+                    // Hapus logika parsing JSON yang menyebabkan teks loncat tinggi-rendah.
+                    // Tampilkan argumen apa adanya (raw), dipotong jika kepanjangan.
+                    // Ini jauh lebih stabil di terminal Ink.
+                    let formattedArgs = tc.function.arguments || '';
+                    if (formattedArgs.length > 200) {
+                        formattedArgs = formattedArgs.slice(0, 200) + '...';
                     }
 
                     return (
