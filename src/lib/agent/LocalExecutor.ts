@@ -14,6 +14,8 @@ export interface ExecutorParams {
     onStatusUpdate: (status: string | null) => void;
     onLiveOutput: (output: string) => void;
     onNeedApproval: (info: PendingToolCall) => Promise<'allow' | 'deny' | 'always'>;
+    allowedTools: string[];
+    onToolWhitelisted: (name: string) => void;
     onError: (error: string) => void;
     signal?: AbortSignal;
     iterationLimit?: number;
@@ -31,6 +33,7 @@ export class LocalExecutor {
         let client = createClient(apiKey);
         let currentMessages = [...messages];
         let state: AgentStatus = 'THINKING';
+        const currentAllowedTools = new Set(params.allowedTools || []);
         this.iterationCount = 0;
 
         // Loop Detection Data
@@ -96,45 +99,64 @@ export class LocalExecutor {
                         tool_calls: []
                     };
 
-                    // Add placeholder
-                    const bubbleIdx = currentMessages.length;
-                    currentMessages = [...currentMessages, assistantMsg];
-                    onUpdateMessages(currentMessages);
-
                     let toolCallsBuffer: any[] = [];
                     let lastUpdate = 0;
+                    let isAddedToHistory = false;
 
                     for await (const chunk of stream) {
                         const delta = chunk.choices[0]?.delta;
                         if (delta?.content) {
                             assistantMsg.content = (assistantMsg.content || '') + delta.content;
-                            // Truncate logic
+
+                            if (!isAddedToHistory) {
+                                currentMessages.push(assistantMsg);
+                                isAddedToHistory = true;
+                                onUpdateMessages([...currentMessages]);
+                            }
+
                             if (assistantMsg.content.length > 50000) {
                                 assistantMsg.content = truncateForRAM(assistantMsg.content);
                             }
                             const now = Date.now();
-                            if (now - lastUpdate > 100) {
-                                currentMessages[bubbleIdx] = { ...assistantMsg };
-                                onUpdateMessages([...currentMessages]);
+                            const hasNewline = delta.content.includes('\n');
+                            if (hasNewline || (now - lastUpdate > 30)) {
+                                if (isAddedToHistory) {
+                                    currentMessages[currentMessages.length - 1] = { ...assistantMsg };
+                                    onUpdateMessages([...currentMessages]);
+                                }
                                 lastUpdate = now;
                             }
                         }
                         if (delta?.tool_calls) {
+                            if (!isAddedToHistory) {
+                                currentMessages.push(assistantMsg);
+                                isAddedToHistory = true;
+                                onUpdateMessages([...currentMessages]);
+                            }
+
                             for (const tc of delta.tool_calls) {
                                 if (tc.index !== undefined) {
                                     if (!toolCallsBuffer[tc.index]) toolCallsBuffer[tc.index] = { id: tc.id, type: tc.type, function: { name: '', arguments: '' } };
                                     if (tc.id) toolCallsBuffer[tc.index].id = tc.id;
                                     if (tc.function?.name) toolCallsBuffer[tc.index].function.name += tc.function.name;
                                     if (tc.function?.arguments) toolCallsBuffer[tc.index].function.arguments += tc.function.arguments;
+
+                                    if (isAddedToHistory) {
+                                        assistantMsg.tool_calls = [...toolCallsBuffer];
+                                        currentMessages[currentMessages.length - 1] = { ...assistantMsg };
+                                        onUpdateMessages([...currentMessages]);
+                                    }
                                 }
                             }
                         }
                     }
 
                     // Final update for this turn
-                    if (toolCallsBuffer.length > 0) assistantMsg.tool_calls = toolCallsBuffer;
-                    currentMessages[bubbleIdx] = { ...assistantMsg };
-                    onUpdateMessages([...currentMessages]);
+                    if (isAddedToHistory) {
+                        assistantMsg.tool_calls = toolCallsBuffer.length > 0 ? toolCallsBuffer : undefined;
+                        currentMessages[currentMessages.length - 1] = { ...assistantMsg };
+                        onUpdateMessages([...currentMessages]);
+                    }
 
                     if (toolCallsBuffer.length > 0) {
                         state = 'EXECUTING_TOOLS';
@@ -167,6 +189,11 @@ export class LocalExecutor {
                 let needsHeal = false;
                 let healPrompt = "";
 
+                // Sensitivity List: Tools that REQUIRE approval
+                const SENSITIVE_TOOLS = [
+                    'write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash', 'google_web_search', 'delegate_to_agent'
+                ];
+
                 for (const tc of lastMsg.tool_calls) {
                     const toolName = tc.function.name;
                     let args: any = {};
@@ -177,14 +204,33 @@ export class LocalExecutor {
                         continue;
                     }
 
-                    // Check Logic Approval here (skipped for brevity, but crucial for security)
-                    // ... Approval Logic similar to useChat ... 
-                    const needsApproval = ['write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash'].includes(toolName);
-                    // Assuming allowed for now or passed from params wrapper in real impl
+                    // --- [SECURITY] Approval Logic ---
+                    if (SENSITIVE_TOOLS.includes(toolName) && !currentAllowedTools.has(toolName)) {
+                        onStatusUpdate(null); // Pause status
+                        const decision = await onNeedApproval({
+                            tool_call_id: tc.id,
+                            name: toolName,
+                            arguments: args
+                        });
 
-                    // Ideally we should callback to params.onNeedApproval if not whitelisted
-                    // BUT for now let's assume whitelisting is handled in UI layer or we replicate it here.
-                    // To keep it simple, I will call the callback.
+                        if (decision === 'deny') {
+                            toolMessages.push({
+                                id: 'tool-deny-' + Date.now(),
+                                role: 'tool',
+                                tool_call_id: tc.id,
+                                name: toolName,
+                                content: "[STOPPED] User denied permission to run this tool."
+                            });
+                            state = 'DONE';
+                            break;
+                        }
+
+                        if (decision === 'always') {
+                            currentAllowedTools.add(toolName);
+                            params.onToolWhitelisted?.(toolName);
+                        }
+                        // If 'allow', proceed below.
+                    }
 
                     onStatusUpdate(`Executing ${toolName}...`);
 
@@ -231,12 +277,14 @@ export class LocalExecutor {
                 currentMessages = [...currentMessages, ...toolMessages];
                 onUpdateMessages(currentMessages);
 
-                if (needsHeal) {
-                    currentMessages.push({ id: 'heal-' + Date.now(), role: 'user', content: healPrompt });
-                    onUpdateMessages(currentMessages);
-                    state = 'THINKING'; // Re-think with heal prompt
-                } else {
-                    state = 'THINKING'; // Continue thinking with tool results
+                if (state !== 'DONE') {
+                    if (needsHeal) {
+                        currentMessages.push({ id: 'heal-' + Date.now(), role: 'user', content: healPrompt });
+                        onUpdateMessages(currentMessages);
+                        state = 'THINKING';
+                    } else {
+                        state = 'THINKING'; // Continue thinking with tool results
+                    }
                 }
             }
         }
@@ -264,19 +312,40 @@ ${sysContext}
         if (assistants.length < 3) return false;
 
         const getSig = (m: Message) => {
-            const tools = (m.tool_calls || []).map(t => t.function.name + JSON.stringify(t.function.arguments)).join(',');
-            return (m.content || '') + '::' + tools;
+            const content = (m.content || '').trim().toLowerCase();
+            const tools = (m.tool_calls || []).map(t => {
+                let args = t.function.arguments || '';
+                try {
+                    // Normalize JSON to prevent loops based on formatting
+                    args = JSON.stringify(JSON.parse(args));
+                } catch (e) { /* ignore */ }
+                return `${t.function.name}:${args}`;
+            }).join('|');
+            return `${content}::${tools}`;
         };
 
         const sigs = assistants.map(getSig);
         const last = sigs.length - 1;
 
-        // A-A-A
+        // Pattern 1: A-A-A (Direct repeat)
         if (sigs[last] === sigs[last - 1] && sigs[last] === sigs[last - 2]) return true;
-        // A-B-A-B
+
+        // Pattern 2: A-B-A-B (Oscillation)
         if (assistants.length >= 4) {
-            if (sigs[last] === sigs[last - 2] && sigs[last - 1] === sigs[last - 3]) return true;
+            if (sigs[last] === sigs[last - 2] && sigs[last - 1] === sigs[last - 3]) {
+                // Ignore if it's just "Thinking..." or very short content without tools
+                // as that might be valid back-and-forth sometimes, but usually ABAB is a loop.
+                return true;
+            }
         }
+
+        // Pattern 3: Empty Response Loop (Thinking but not acting)
+        const recentAssistants = assistants.slice(-4);
+        const allEmpty = recentAssistants.length >= 4 && recentAssistants.every(m =>
+            (!m.content || !m.content.trim()) && (!m.tool_calls || m.tool_calls.length === 0)
+        );
+        if (allEmpty) return true;
+
         return false;
     }
 

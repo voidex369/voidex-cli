@@ -1,6 +1,9 @@
-# Project TODOs (Updated 30/12/2025, 21.07.49)
+# Project TODOs
 
-- [ ] Scan sql2.txt targets for SQL Injection
-- [ ] Run sqlmap on each URL
-- [ ] Save confirmed vulnerabilities
-- [ ] Generate report for sql2 targets
+- [ ] ✅ Create list of 20 target URLs
+- [ ] ✅ Run sqlmap on 20 targets
+- [ ] ✅ Manual SQLi verification
+- [ ] ✅ Time-based SQLi test
+- [ ] ✅ Union-based SQLi test
+- [ ] ✅ Generate SQLMap report
+- [ ] ✅ Document findings

@@ -136,22 +136,22 @@ const StatusArea = React.memo(({ agentStatus, liveToolOutput, pendingApproval, a
     }, [liveToolOutput]);
 
     return (
-        <Box flexDirection="column" flexShrink={0} marginBottom={1} borderStyle="single" borderColor="yellow" paddingX={1}>
+        <Box flexDirection="column" flexGrow={0} flexShrink={0} marginBottom={1} borderStyle="single" borderColor="yellow" paddingX={1} width="100%">
             {agentStatus && (
-                <Box flexDirection="column">
-                    <Box><Text color="yellow">⏳</Text><Text bold> {agentStatus}</Text></Box>
+                <Box flexDirection="column" width="100%">
+                    <Box width="100%"><Text color="yellow">⏳</Text><Text bold> {agentStatus}</Text></Box>
                     {/* [FIX] Ensure output area has minimum height if content exists, to reduce layout shift */}
                     {cappedOutput ? (
-                        <Box marginTop={1} flexDirection="column">
+                        <Box marginTop={1} flexDirection="column" width="100%">
                             <Text color="gray">{cappedOutput}</Text>
                         </Box>
                     ) : null}
                 </Box>
             )}
             {pendingApproval && (
-                <Box flexDirection="column" marginTop={1}>
+                <Box flexDirection="column" marginTop={1} width="100%">
                     <Text bold color="yellow">⚠ Safety Check: {pendingApproval.name}</Text>
-                    <Box flexDirection="column" marginTop={1} marginLeft={1}>
+                    <Box flexDirection="column" marginTop={1} marginLeft={1} width="100%">
                         {approvalOptions.map((opt: any, i: number) => (
                             <Text key={opt.value} color={i === approvalIndex ? 'cyan' : 'white'} bold={i === approvalIndex}>
                                 {i === approvalIndex ? '●' : ' '} {opt.label}
@@ -165,11 +165,11 @@ const StatusArea = React.memo(({ agentStatus, liveToolOutput, pendingApproval, a
 });
 
 const InputArea = React.memo(({ input, setInput, handleSend, suggestions, selectedIndex, hasMemory }: any) => (
-    <Box flexDirection="column" flexShrink={0} flexGrow={0}>
+    <Box flexDirection="column" flexShrink={0} flexGrow={0} width="100%">
         {suggestions.length > 0 && (
-            <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1}>
+            <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1} width="100%">
                 {suggestions.map((s: any, i: number) => (
-                    <Box key={s.cmd} flexDirection="row">
+                    <Box key={s.cmd} flexDirection="row" width="100%">
                         <Text color={i === selectedIndex ? 'cyan' : 'white'} bold={i === selectedIndex}>
                             {i === selectedIndex ? '> ' : '  '}{s.cmd}
                         </Text>
@@ -180,19 +180,19 @@ const InputArea = React.memo(({ input, setInput, handleSend, suggestions, select
         )}
 
         {/* [FIX] Box Input dengan layout yang diminta */}
-        <Box borderStyle="single" borderColor="green" paddingX={1} flexDirection="column">
+        <Box borderStyle="single" borderColor="green" paddingX={1} flexDirection="column" width="100%">
 
             {/* Baris 1: Input */}
-            <Box flexDirection="row">
+            <Box flexDirection="row" width="100%">
                 <Box marginRight={1}><Text bold color="green">❯</Text></Box>
-                <Box flexGrow={1} height={1} minHeight={1}>
-                    <TextInput value={input} onChange={setInput} onSubmit={handleSend} placeholder="Type or / for commands..." />
+                <Box flexGrow={1} minHeight={1}>
+                    <TextInput value={input} onChange={setInput} placeholder="Type or / for commands..." />
                 </Box>
             </Box>
 
             {/* Baris 2: Status Memory (Dengan Jarak) */}
             {hasMemory && (
-                <Box marginTop={1}>
+                <Box marginTop={1} width="100%">
                     {/* Dihapus 'size' prop yang error, ditambah marginTop=1 untuk spasi kosong */}
                     <Text dimColor italic>└─ Sovereign memory active</Text>
                 </Box>
@@ -203,7 +203,7 @@ const InputArea = React.memo(({ input, setInput, handleSend, suggestions, select
 
 // HistoryViewport is now imported
 
-const ChatView = React.memo(({ onDialog, chatState }: any) => {
+const ChatView = React.memo(({ onDialog, chatState, isFullScreen }: any) => {
     const {
         messages, isLoading, error, sendMessage, agentStatus, stopLoading,
         hasMemory, pendingApproval, resolveApproval, liveToolOutput,
@@ -286,6 +286,21 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
             return;
         }
 
+        // --- Multi-line and Submission Logic ---
+        const isEnter = key.return;
+
+        // 1. Submit on Enter (No Shift, No Ctrl)
+        if (isEnter && !key.shift && !key.ctrl && suggestions.length === 0) {
+            handleSend(input);
+            return;
+        }
+
+        // 2. Newline on Ctrl+J or Shift+Enter
+        if ((key.ctrl && (inputChars === 'j' || inputChars === '\n')) || (isEnter && key.shift)) {
+            setInput(prev => prev + '\n');
+            return;
+        }
+
         if (suggestions.length > 0) {
             if (key.tab && suggestions[selIdx]) {
                 setInput(suggestions[selIdx].cmd + (suggestions[selIdx].cmd.endsWith(' ') ? '' : ' '));
@@ -296,31 +311,16 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
             return;
         }
 
-        if (key.upArrow) {
+        if (key.upArrow && !key.shift) {
             setHistIdx(prev => {
                 const newIdx = Math.min(prev + 1, history.length - 1);
                 if (newIdx !== prev && newIdx >= 0) setInput(history[history.length - 1 - newIdx]);
                 return newIdx;
             });
         }
-        else if (key.downArrow) {
+        else if (key.downArrow && !key.shift) {
             setHistIdx(prev => {
                 const newIdx = Math.max(prev - 1, -1);
-                if (newIdx === -1) setInput('');
-                else if (newIdx !== prev) setInput(history[history.length - 1 - newIdx]);
-                return newIdx;
-            });
-        }
-        else if (key.pageUp) {
-            setHistIdx(prev => {
-                const newIdx = Math.min(prev + 5, history.length - 1);
-                if (newIdx !== prev && newIdx >= 0) setInput(history[history.length - 1 - newIdx]);
-                return newIdx;
-            });
-        }
-        else if (key.pageDown) {
-            setHistIdx(prev => {
-                const newIdx = Math.max(prev - 5, -1);
                 if (newIdx === -1) setInput('');
                 else if (newIdx !== prev) setInput(history[history.length - 1 - newIdx]);
                 return newIdx;
@@ -354,14 +354,14 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
     }, [sendMessage, onDialog]);
 
     return (
-        <Box flexDirection="column" width="100%" height="100%">
+        <Box flexDirection="column" width="100%" height={isFullScreen ? '100%' : undefined}>
             {/* New Virtualized History Viewport */}
-            <Box flexGrow={1} minHeight={0}>
-                <HistoryViewport messages={messages} />
+            <Box flexGrow={isFullScreen ? 1 : 0} minHeight={0} width="100%">
+                <HistoryViewport messages={messages} isFullScreen={isFullScreen} isLoading={isLoading} />
             </Box>
 
             {/* [FIX] Layout Stability Wrapper */}
-            <Box flexDirection="column" marginTop={0} flexGrow={0} flexShrink={0}>
+            <Box flexDirection="column" marginTop={0} flexGrow={0} flexShrink={0} width="100%">
 
                 {/* Error Notices */}
                 {(showExitNotice || error) && (
@@ -396,7 +396,7 @@ const ChatView = React.memo(({ onDialog, chatState }: any) => {
     );
 });
 
-export default function Chat() {
+export default function Chat({ isFullScreen }: { isFullScreen: boolean }) {
     const chatState = useChat();
     const { sendMessage } = chatState;
     const [dialog, setDialog] = useState<null | 'model' | 'auth' | 'theme'>(null);
@@ -423,5 +423,5 @@ export default function Chat() {
     if (dialog === 'theme') return <Box padding={2}><ThemePicker onSelect={(t: string) => { setTheme(t); setDialog(null); }} onCancel={closeDialog} /></Box>;
     if (dialog === 'auth') return <Box padding={2}><AuthDialog currentKey={getApiKey() || ''} onSave={handleAuthSave} onCancel={closeDialog} /></Box>;
 
-    return <ChatView onDialog={setDialog} chatState={chatState} />;
+    return <ChatView onDialog={setDialog} chatState={chatState} isFullScreen={isFullScreen} />;
 }

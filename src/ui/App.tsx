@@ -13,12 +13,20 @@ import { ThemeProvider } from './contexts/ThemeContext.js';
 
 type View = 'welcome' | 'chat' | 'auth';
 
+import { useWindowSize } from './hooks/useWindowSize.js';
+
 export default function App() {
     const [view, setView] = useState<View>('welcome');
     const [apiKey, setApiKey] = useState('');
+    const { height } = useWindowSize();
 
-    // Enable alternate buffer only when we are in the main 'chat' view to keep clean transitions
-    useAlternateBuffer(view === 'chat');
+
+
+    // Toggle this to switch between 'Inline' (Native Scrolling) and 'Full Screen' (TUI)
+    const isFullScreen = false;
+
+    // Enable alternate buffer only when we are in the main 'chat' view and isFullScreen is ON
+    useAlternateBuffer(view === 'chat' && isFullScreen);
 
     useEffect(() => {
         // Simple View Logic
@@ -31,7 +39,7 @@ export default function App() {
 
     if (view === 'welcome') {
         return (
-            <Box flexDirection="column" alignItems="center" justifyContent="center" height="100%">
+            <Box flexDirection="column" alignItems="center" justifyContent="center" height={height}>
                 <Gradient name="morning">
                     <BigText text="VoidEx CLI" font="simple" />
                 </Gradient>
@@ -42,7 +50,7 @@ export default function App() {
 
     if (view === 'auth') {
         return (
-            <Box flexDirection="column" justifyContent="center" alignItems="center" height="100%">
+            <Box flexDirection="column" justifyContent="center" alignItems="center" height={height}>
                 <Text bold color="cyan">WELCOME TO VOIDEX CLI</Text>
                 <Text>Please enter your OpenRouter API Key to activate the Sovereign Agent:</Text>
                 <Box borderStyle="round" borderColor="cyan" paddingX={1} marginTop={1}>
@@ -68,8 +76,8 @@ export default function App() {
             <MouseProvider mouseEventsEnabled={true}>
                 <ThemeProvider>
                     <ScrollProvider>
-                        <Box flexDirection="column" height="100%">
-                            <Chat />
+                        <Box flexDirection="column" height={isFullScreen ? height : undefined}>
+                            <Chat isFullScreen={isFullScreen} />
                         </Box>
                     </ScrollProvider>
                 </ThemeProvider>

@@ -51,7 +51,7 @@ export async function runShellCommand({ command, onOutput, timeout }: { command:
         activeChildProcess = child;
 
         const MAX_BUFFER_SIZE = 50000;
-        
+
         // Tool berat tetap kita biarkan jalan selamanya (Infinity Timeout)
         const isHeavyTool = /^(sqlmap|nmap|hydra|wpscan|nikto|gobuster|ffuf|dirb|ping|ssh|tail|watch|nc|netcat)/i.test(command.trim());
         const DEFAULT_IDLE_TIMEOUT = 30000; // 30s buat tool biasa
@@ -108,7 +108,7 @@ export async function runShellCommand({ command, onOutput, timeout }: { command:
             if (isInteractivePrompt(chunk)) {
                 // BAHAYA: Terdeteksi ciri-ciri pertanyaan!
                 // Pasang timer pendek (3 detik). Kalau beneran diem, berarti nunggu input.
-                setKillTimer(3000); 
+                setKillTimer(3000);
             } else {
                 // AMAN: Log biasa.
                 if (isHeavyTool) {
@@ -156,16 +156,8 @@ export async function runShellCommand({ command, onOutput, timeout }: { command:
             if (timer) clearTimeout(timer);
             activeChildProcess = null;
 
-            let finalOutput = output.trim();
-            if (isTimeout) {
-                // Pesan ini dimodifikasi agar Agent lebih peka
-                finalOutput += `\n\n[PROCESS PAUSED] Tool berhenti merespon (Potential Interactive Prompt Detected).
-Sistem mendeteksi baris terakhir mungkin adalah pertanyaan (seperti 'Enter...', 'Select...', '?', ':', '>').
-ANALISA output terakhir di atas. Jika tool meminta input, jalankan ulang dengan argumen tambahan atau pipe input.`;
-            }
-
             resolve({
-                output: finalOutput || (code === 0 ? "Command executed successfully" : `Process exited with code ${code}`),
+                output: output.trim() || (code === 0 ? "Command executed successfully" : `Process exited with code ${code}`),
                 isError: code !== 0 || isError || isKilled
             });
         });
@@ -261,7 +253,7 @@ export async function searchText({ query, path: searchPath = '.' }: { query: str
                         const lines = content.split('\n');
                         const matches = lines.map((line, idx) => line.includes(query) ? `${relPath}:${idx + 1}: ${line.trim()}` : null).filter(Boolean) as string[];
                         if (matches.length > 0) results.push(...matches.slice(0, 20));
-                    } catch (e) {}
+                    } catch (e) { }
                 }
             }
         }

@@ -265,6 +265,14 @@ ${sysContext}
                         return res;
                     });
                 },
+                allowedTools: allowedToolsRef.current,
+                onToolWhitelisted: (name) => {
+                    setAllowedToolsForSession(prev => {
+                        const next = [...prev, name];
+                        allowedToolsRef.current = next;
+                        return next;
+                    });
+                },
                 onError: (err) => {
                     if (requestId === currentRequestIdRef.current) setError(err);
                 },

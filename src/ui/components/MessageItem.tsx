@@ -117,7 +117,7 @@ export const TruncatedResultBox = React.memo(({ content, isSuccess }: { content:
 
 export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
     const { theme } = useTheme();
-    const boxProps = { flexDirection: "column" as const, marginBottom: 1, flexShrink: 0 };
+    const boxProps = { flexDirection: "column" as const, marginBottom: 1, flexShrink: 0, width: "100%" as const };
 
     if (msg.role === 'system') {
         if (msg.name === 'welcome_msg') return <WelcomeBox />;
@@ -130,7 +130,7 @@ export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
         const isSuccess = !msg.content?.toLowerCase().includes('error') && !msg.content?.toLowerCase().includes('failed');
         const color = isSuccess ? theme.status.success : theme.status.error;
         return (
-            <Box {...boxProps} marginLeft={2} borderStyle="round" borderColor={color} paddingX={1}>
+            <Box {...boxProps} marginLeft={1} borderStyle="round" borderColor={color} paddingX={1} width="100%">
                 <Text bold color={color}>{isSuccess ? '✓' : '✖'} Tool Result:</Text>
                 <TruncatedResultBox content={msg.content || ''} isSuccess={isSuccess} />
             </Box>
@@ -139,11 +139,17 @@ export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
 
     if (msg.role === 'assistant') {
         const hasTools = msg.tool_calls && msg.tool_calls.length > 0;
+        const hasContent = msg.content && msg.content.trim().length > 0;
+
+        // Skip rendering if no content and no tools (Ghost Message)
+        if (!hasContent && !hasTools) return null;
+
         return (
-            <Box {...boxProps}>
+            <Box {...boxProps} width="100%">
+                {/* Only show header if there is something to follow, or if we want to show it's thinking */}
                 <Text bold color={theme.text.accent}>Agent:</Text>
-                {msg.content && (
-                    <Box paddingLeft={2} marginBottom={hasTools ? 1 : 0}>
+                {hasContent && (
+                    <Box paddingLeft={1} marginBottom={hasTools ? 1 : 0} width="100%">
                         <Text color={theme.text.response || theme.text.primary} >{msg.content}</Text>
                     </Box>
                 )}
@@ -162,9 +168,9 @@ export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
                     }
 
                     return (
-                        <Box key={idx} flexDirection="column" borderStyle="round" borderColor={theme.text.accent} paddingX={1} marginTop={idx === 0 ? 0 : 1}>
+                        <Box key={idx} flexDirection="column" borderStyle="round" borderColor={theme.text.accent} paddingX={1} marginTop={idx === 0 ? 0 : 1} width="100%">
                             <Text bold color={theme.text.accent}>⚙ Tool Call: {tc.function.name}</Text>
-                            <Box paddingLeft={1}><Text dimColor italic>{formattedArgs}</Text></Box>
+                            <Box paddingLeft={1} width="100%"><Text dimColor italic>{formattedArgs}</Text></Box>
                         </Box>
                     );
                 })}
@@ -173,7 +179,7 @@ export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
     }
 
     return (
-        <Box {...boxProps} borderStyle="round" borderColor={theme.border.focused} paddingX={1}>
+        <Box {...boxProps} borderStyle="round" borderColor={theme.border.focused} paddingX={1} width="100%">
             <Text bold color={theme.text.link}>👤 You:</Text>
             <Text color={theme.text.primary}>{msg.content}</Text>
         </Box>

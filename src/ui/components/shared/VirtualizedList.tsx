@@ -14,11 +14,11 @@ import {
     useMemo,
     useCallback,
 } from 'react';
-import type React from 'react';
+import React from 'react';
 import { useTheme } from '../../contexts/ThemeContext.js';
 import { useBatchedScroll } from '../../hooks/useBatchedScroll.js';
 
-import { type DOMElement, measureElement, Box } from 'ink';
+import { type DOMElement, measureElement, Box, Text } from 'ink';
 
 export const SCROLL_TO_ITEM_END = Number.MAX_SAFE_INTEGER;
 
@@ -365,6 +365,10 @@ function VirtualizedList<T>(
         }
     }
 
+
+
+
+
     const { getScrollTop, setPendingScrollTop } = useBatchedScroll(scrollTop);
 
     useImperativeHandle(
@@ -482,7 +486,7 @@ function VirtualizedList<T>(
             flexDirection="column"
             paddingRight={1}
         >
-            <Box flexShrink={0} width="100%" flexDirection="column">
+            <Box flexShrink={0} width="100%" flexDirection="column" marginTop={-scrollTop}>
                 <Box height={topSpacerHeight} flexShrink={0} />
                 {renderedItems}
                 <Box height={bottomSpacerHeight} flexShrink={0} />
@@ -491,10 +495,11 @@ function VirtualizedList<T>(
     );
 }
 
-const VirtualizedListWithForwardRef = forwardRef(VirtualizedList) as <T>(
+const VirtualizedListWithForwardRef = React.memo(forwardRef(VirtualizedList)) as <T>(
     props: VirtualizedListProps<T> & { ref?: React.Ref<VirtualizedListRef<T>> },
 ) => React.ReactElement;
 
 export { VirtualizedListWithForwardRef as VirtualizedList };
 
-VirtualizedList.displayName = 'VirtualizedList';
+// Display name must be set on the memoized component or the inner component
+(VirtualizedListWithForwardRef as any).displayName = 'VirtualizedList';
