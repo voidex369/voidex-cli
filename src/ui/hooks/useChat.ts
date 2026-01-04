@@ -19,10 +19,6 @@ let shadowMessages: Message[] = [{ id: 'welcome', role: 'system', name: 'welcome
 let shadowAllowedTools: string[] = [];
 let shadowHistory: string[] = [];
 
-// --- LIMITS ---
-// --- LIMITS ---
-// ITERATION_SOFT_LIMIT is now handled in LocalExecutor
-
 export function useChat() {
     const config = getGenericConfig();
     const currentApiKey = getApiKey();
@@ -59,8 +55,7 @@ export function useChat() {
 
     // --- UPDATE CHECKER ---
     useEffect(() => {
-        // Mock update check
-        if (Math.random() > 0.8) { // 20% chance to show update
+        if (Math.random() > 0.8) {
             setTimeout(() => {
                 setMessages(prev => [...prev, { id: 'sys-update-' + Date.now(), role: 'system', content: '[NOTICE] A new version of VoidEx CLI is available! Run `git pull` to update.' }]);
             }, 3000);
@@ -69,40 +64,26 @@ export function useChat() {
 
     const approvalResolver = useRef<((choice: 'allow' | 'deny' | 'always') => void) | null>(null);
 
-    const getSovereignPrompt = useCallback(() => {
-        const sysContext = getSystemContext();
-        return `### IDENTITY
-You are a SOVEREIGN AGENT. You have FULL ACCESS to this system. 
-You are the EXECUTER, not just a mentor. Use your tools to achieve the user's objective.
-
-### SYSTEM CONTEXT
-${sysContext}
-
-### INSTRUCTIONS
-1. Use natural language followed by Tool Calls.
-2. If a command fails, analyze the error and try a different approach.
-3. Keep your internal monologue brief.
-4. Achieve the objective at all costs.`;
-    }, []);
-
     const abortController = useRef<AbortController | null>(null);
 
     // --- AUTO-SAVE ---
     useEffect(() => {
         const timeout = setTimeout(() => {
-            if (messages.length > 2) { // Don't save empty/welcome chats
+            if (messages.length > 2) {
                 try {
                     saveChat('autosave', messages);
                 } catch (e) {
                     // silent fail
                 }
             }
-        }, 2000); // Debounce 2s
+        }, 2000);
         return () => clearTimeout(timeout);
     }, [messages]);
 
     const executorRef = useRef<LocalExecutor>(new LocalExecutor());
 
+    // [FIX] STOP LOADING LOGIC YANG LEBIH CERDAS
+    // Menutup Tool Call yang menggantung biar AI gak bingung di prompt selanjutnya.
     const stopLoading = useCallback(() => {
         if (abortController.current) {
             abortController.current.abort();
@@ -110,14 +91,39 @@ ${sysContext}
         }
         currentRequestIdRef.current++;
         const killed = killActiveProcess();
-        if (killed) {
-            setMessages(prev => [...prev, { id: 'sys-' + Date.now(), role: 'system', content: '[NOTICE] Active process terminated by user.' }]);
-        }
+
+        setMessages(prev => {
+            const lastMsg = prev[prev.length - 1];
+            const newMsgs = [...prev];
+
+            // 1. Cek apakah pesan terakhir adalah Assistant yang lagi mau nge-Tool?
+            if (lastMsg && lastMsg.role === 'assistant' && lastMsg.tool_calls && lastMsg.tool_calls.length > 0) {
+                // 2. Kalau iya, kita harus masukin pesan "Tool Result" palsu yang isinya "Interrupted"
+                // Ini PENTING biar context LLM jadi valid (User -> Assistant -> Tool Result).
+                lastMsg.tool_calls.forEach(tc => {
+                    newMsgs.push({
+                        id: 'tool-stop-' + Date.now() + Math.random(),
+                        role: 'tool',
+                        tool_call_id: tc.id,
+                        name: tc.function.name,
+                        content: 'Process terminated by user (SIGINT/Ctrl+C). Execution stopped.'
+                    });
+                });
+            }
+
+            // 3. Tambahkan pesan System Notice biasa buat UI user
+            if (killed || isLoading) {
+                newMsgs.push({ id: 'sys-' + Date.now(), role: 'system', content: '[NOTICE] Active process terminated by user.' });
+            }
+
+            shadowMessages = newMsgs; // Sync shadow biar executor berikutnya baca history yang bener
+            return newMsgs;
+        });
+
         setIsLoading(false);
         setAgentStatus(null);
-    }, []);
-
-    // processStream has been refactored into LocalExecutor
+        setPendingApproval(null); // Reset approval kalau ada
+    }, [isLoading]);
 
 
     const sendMessage = useCallback(async (rawContent: string) => {
@@ -227,12 +233,14 @@ ${sysContext}
 
         const userMsg: Message = { id: 'user-' + Date.now() + '-' + Math.random().toString(36).substring(2, 7), role: 'user', content: truncateForRAM(content) };
 
+        // [IMPORTANT] Stop previous request before starting new one
         stopLoading();
 
         const requestId = currentRequestIdRef.current;
         abortController.current = new AbortController();
         const signal = abortController.current.signal;
 
+        // Force refresh messages from ref to ensure we have the "Stop" message included
         let currentMsgs = [...messagesRef.current, userMsg];
 
         setMessages(currentMsgs);
@@ -289,7 +297,7 @@ ${sysContext}
                 abortController.current = null;
             }
         }
-    }, [stopLoading]);
+    }, [stopLoading]); // Dependency on new stopLoading
 
     const forgetMessages = useCallback((count: number) => {
         setMessages(prev => {

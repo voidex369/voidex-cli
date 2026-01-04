@@ -1,66 +1,122 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { z } from 'zod';
+import { Message } from '../types/index.js';
 
-const CONFIG_DIR = path.join(os.homedir(), '.voidex-cli');
+// --- CONSTANTS ---
+const HOMEDIR = os.homedir();
+// Folder Utama: ~/.voidex-cli
+const CONFIG_DIR = path.join(HOMEDIR, '.voidex-cli');
+// File Config JSON (Model, Theme, dll)
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
-const HISTORY_DIR = path.join(CONFIG_DIR, 'history');
+// Folder Chat History
+const CHATS_DIR = path.join(CONFIG_DIR, 'chats');
 
-if (!fs.existsSync(CONFIG_DIR)) fs.mkdirSync(CONFIG_DIR, { recursive: true });
-if (!fs.existsSync(HISTORY_DIR)) fs.mkdirSync(HISTORY_DIR, { recursive: true });
+// [PENTING] Lokasi .env sekarang di GLOBAL (~/.voidex-cli/.env)
+// Biar bisa diakses dari direktori mana saja saat pakai CLI.
+const ENV_PATH = path.join(CONFIG_DIR, '.env');
 
-const ConfigSchema = z.object({
-    apiKey: z.string().optional(),
-    model: z.string().default('google/gemini-2.0-flash-exp:free'),
-});
-
-type Config = z.infer<typeof ConfigSchema>;
-
-// [Task A] Robust deep merge for configuration objects
-function deepMerge<T extends object>(target: T, source: Partial<T>): T {
-    const result = { ...target };
-    for (const key in source) {
-        if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
-            (result as any)[key] = deepMerge((target as any)[key] || {}, source[key] as any);
-        } else {
-            (result as any)[key] = source[key];
-        }
-    }
-    return result;
+// --- INTERFACES ---
+interface CliConfig {
+    model: string;
+    apiKey?: string; // Legacy support (akan dihapus otomatis)
+    theme?: string;
 }
 
-export function getGenericConfig(): Config {
-    try {
-        if (!fs.existsSync(CONFIG_FILE)) return ConfigSchema.parse({});
-        const raw = fs.readFileSync(CONFIG_FILE, 'utf-8');
+// --- INITIALIZATION ---
+function ensureConfigDir() {
+    if (!fs.existsSync(CONFIG_DIR)) {
+        fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(CHATS_DIR)) {
+        fs.mkdirSync(CHATS_DIR, { recursive: true });
+    }
+}
+
+// --- CORE CONFIG (JSON) ---
+export function getGenericConfig(): CliConfig {
+    ensureConfigDir();
+    if (fs.existsSync(CONFIG_FILE)) {
         try {
-            return ConfigSchema.parse(JSON.parse(raw));
-        } catch (parseError) {
-            // [Task A] Corruption Recovery: Backup and load defaults
-            const backupFile = CONFIG_FILE + '.bak';
-            fs.copyFileSync(CONFIG_FILE, backupFile);
-            console.error(`[CONFIG ERROR] Corrupted config.json backed up to ${backupFile}. Resetting to defaults.`);
-            return ConfigSchema.parse({});
+            const data = fs.readFileSync(CONFIG_FILE, 'utf-8');
+            return JSON.parse(data);
+        } catch (e) {
+            return { model: 'google/gemini-2.0-flash-exp:free' };
         }
-    } catch (e) {
-        return ConfigSchema.parse({});
     }
+    return { model: 'google/gemini-2.0-flash-exp:free' };
 }
 
-export function saveConfig(newConfig: Partial<Config>) {
-    const current = getGenericConfig();
-    const merged = deepMerge(current, newConfig); // [Task A] Use deep merge
-    fs.writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2));
+export function saveGenericConfig(config: CliConfig) {
+    ensureConfigDir();
+    fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
 }
+
+// --- API KEY MANAGEMENT (GLOBAL ENV) ---
 
 export function getApiKey(): string | undefined {
-    return getGenericConfig().apiKey;
+    // 1. Cek Memory Node.js (Prioritas Utama)
+    if (process.env.OPENROUTER_API_KEY) {
+        return process.env.OPENROUTER_API_KEY;
+    }
+
+    // 2. Cek Global .env File (~/.voidex-cli/.env)
+    if (fs.existsSync(ENV_PATH)) {
+        try {
+            const content = fs.readFileSync(ENV_PATH, 'utf-8');
+            // Regex cari OPENROUTER_API_KEY=...
+            const match = content.match(/^OPENROUTER_API_KEY=(.*)$/m);
+            if (match && match[1]) {
+                const key = match[1].trim();
+                process.env.OPENROUTER_API_KEY = key; // Cache ke memory biar cepet
+                return key;
+            }
+        } catch (e) {
+            // Ignore error read
+        }
+    }
+
+    return undefined;
 }
 
-export function saveApiKey(key: string) {
-    saveConfig({ apiKey: key });
+export function saveApiKey(apiKey: string): void {
+    ensureConfigDir(); // Pastikan folder ~/.voidex-cli ada
+
+    const keyName = 'OPENROUTER_API_KEY';
+    const trimmedKey = apiKey.trim();
+
+    // 1. Update Memory (Runtime)
+    process.env[keyName] = trimmedKey;
+
+    // 2. Update Global .env File
+    let content = '';
+    if (fs.existsSync(ENV_PATH)) {
+        content = fs.readFileSync(ENV_PATH, 'utf-8');
+    }
+
+    const keyRegex = new RegExp(`^${keyName}=(.*)$`, 'm');
+
+    if (keyRegex.test(content)) {
+        // Kalau key sudah ada, timpa barisnya
+        content = content.replace(keyRegex, `${keyName}=${trimmedKey}`);
+    } else {
+        // Kalau belum ada, tambahkan di baris baru
+        const prefix = content.endsWith('\n') || content === '' ? '' : '\n';
+        content += `${prefix}${keyName}=${trimmedKey}\n`;
+    }
+
+    fs.writeFileSync(ENV_PATH, content, 'utf-8');
+
+    // 3. Security Cleanup: Hapus API Key dari config.json (Legacy)
+    // Biar gak double nyimpen dan config.json bersih dari credential.
+    const currentConfig = getGenericConfig();
+    if (currentConfig.apiKey) {
+        delete currentConfig.apiKey;
+        saveGenericConfig(currentConfig);
+    }
 }
+
+// --- MODEL MANAGEMENT ---
 
 export function getAvailableModels(): string[] {
     return [
@@ -106,7 +162,8 @@ export function getAvailableModels(): string[] {
     ];
 }
 
-export function getModelDisplayName(modelId: string): string {
+// [FIXED] Hanya satu fungsi getModelDisplayName & Nama Model Full
+export function getModelDisplayName(model: string): string {
     const uncensoredModels = [
         'cognitivecomputations/dolphin-mistral-24b-venice-edition:free',
         'nousresearch/hermes-3-llama-3.1-405b:free',
@@ -114,53 +171,72 @@ export function getModelDisplayName(modelId: string): string {
         'liquid/lfm-40b:free'
     ];
 
-    if (uncensoredModels.includes(modelId)) {
-        return `${modelId} (Uncensored)`;
+    if (uncensoredModels.includes(model)) {
+        return `${model} (Uncensored)`;
     }
-    return modelId;
+
+    // Kembalikan nama full tanpa dipotong (split)
+    return model;
 }
 
 export function saveModel(model: string) {
-    saveConfig({ model });
+    const config = getGenericConfig();
+    config.model = model;
+    saveGenericConfig(config);
 }
 
-export function saveChat(name: string, messages: any[]) {
-    const file = path.join(HISTORY_DIR, `${name}.json`);
-    fs.writeFileSync(file, JSON.stringify(messages, null, 2));
+// --- CHAT SESSION MANAGEMENT ---
+
+export function saveChat(id: string, messages: Message[]) {
+    ensureConfigDir();
+    const cleanId = id.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const filePath = path.join(CHATS_DIR, `${cleanId}.json`);
+    fs.writeFileSync(filePath, JSON.stringify(messages, null, 2), 'utf-8');
 }
 
-export function loadChat(name: string): any[] {
-    const file = path.join(HISTORY_DIR, `${name}.json`);
-    if (!fs.existsSync(file)) return [];
-    try {
-        return JSON.parse(fs.readFileSync(file, 'utf-8'));
-    } catch (e) {
-        return [];
+export function loadChat(id: string): Message[] {
+    const cleanId = id.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const filePath = path.join(CHATS_DIR, `${cleanId}.json`);
+    if (fs.existsSync(filePath)) {
+        try {
+            return JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        } catch (e) {
+            return [];
+        }
     }
+    return [];
 }
 
 export function listChats(): string[] {
-    if (!fs.existsSync(HISTORY_DIR)) return [];
-    return fs.readdirSync(HISTORY_DIR)
+    ensureConfigDir();
+    if (!fs.existsSync(CHATS_DIR)) return [];
+    return fs.readdirSync(CHATS_DIR)
         .filter(f => f.endsWith('.json'))
         .map(f => f.replace('.json', ''));
 }
 
-export function deleteChat(name: string): boolean {
-    const file = path.join(HISTORY_DIR, `${name}.json`);
-    if (fs.existsSync(file)) {
-        fs.unlinkSync(file);
+export function deleteChat(id: string): boolean {
+    const cleanId = id.replace(/[^a-zA-Z0-9-_]/g, '_');
+    const filePath = path.join(CHATS_DIR, `${cleanId}.json`);
+    if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
         return true;
     }
     return false;
 }
 
-export function exportChat(filePath: string, messages: any[]) {
-    // If not absolute path, put it in current working directory
-    const target = path.isAbsolute(filePath) ? filePath : path.join(process.cwd(), filePath);
-    const content = filePath.endsWith('.json')
-        ? JSON.stringify(messages, null, 2)
-        : messages.map(m => `[${m.role.toUpperCase()}]\n${m.content || ''}\n`).join('\n---\n\n');
+export function exportChat(fileName: string, messages: Message[]) {
+    // Export ke folder tempat user menjalankan perintah (CWD)
+    const targetPath = path.resolve(process.cwd(), fileName);
 
-    fs.writeFileSync(target, content);
+    let content = '';
+    if (fileName.endsWith('.json')) {
+        content = JSON.stringify(messages, null, 2);
+    } else {
+        content = messages.map(m => {
+            return `[${m.role.toUpperCase()}] (${m.id})\n${m.content || '(Tool Call)'}\n${'-'.repeat(40)}`;
+        }).join('\n\n');
+    }
+
+    fs.writeFileSync(targetPath, content, 'utf-8');
 }

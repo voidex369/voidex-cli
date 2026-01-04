@@ -4,7 +4,7 @@ import Gradient from 'ink-gradient';
 import { Message } from '../../types/index.js';
 import { useTheme } from '../contexts/ThemeContext.js';
 
-// --- Sub-components (Memoized for Stability) ---
+// --- Sub-components (Named Exports tetap ada untuk fleksibilitas) ---
 
 export const HelpMenu = React.memo(() => {
     const { theme } = useTheme();
@@ -115,7 +115,7 @@ export const TruncatedResultBox = React.memo(({ content, isSuccess }: { content:
 });
 
 
-export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
+const MessageItem = React.memo(({ msg }: { msg: Message }) => {
     const { theme } = useTheme();
     const boxProps = { flexDirection: "column" as const, marginBottom: 1, flexShrink: 0, width: "100%" as const };
 
@@ -153,10 +153,6 @@ export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
                     </Box>
                 )}
                 {hasTools && msg.tool_calls!.map((tc: any, idx: number) => {
-                    // [FIX VISUAL LOOP]
-                    // Hapus logika parsing JSON yang menyebabkan teks loncat tinggi-rendah.
-                    // Tampilkan argumen apa adanya (raw), dipotong jika kepanjangan.
-                    // Ini jauh lebih stabil di terminal Ink.
                     let formattedArgs = tc.function.arguments || '';
                     if (formattedArgs.length > 200) {
                         formattedArgs = formattedArgs.slice(0, 200) + '...';
@@ -180,3 +176,5 @@ export const MessageItem = React.memo(({ msg }: { msg: Message }) => {
         </Box>
     );
 });
+
+export default MessageItem;

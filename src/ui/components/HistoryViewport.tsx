@@ -7,10 +7,8 @@
 import React, { useRef, useMemo, useCallback } from 'react';
 import { Box, Static, type DOMElement } from 'ink';
 import { VirtualizedList, VirtualizedListRef } from './shared/VirtualizedList.js';
-import { MessageItem } from './MessageItem.js';
+import MessageItem from './MessageItem.js'; // [FIX] Default Import
 import { Message } from '../../types/index.js';
-import { useScrollable } from '../contexts/ScrollProvider.js';
-import { useKeypress } from '../hooks/useKeypress.js';
 import { useWindowSize } from '../hooks/useWindowSize.js';
 
 interface HistoryViewportProps {
@@ -19,13 +17,11 @@ interface HistoryViewportProps {
     isLoading?: boolean;
 }
 
-export const HistoryViewport = React.memo(({ messages, isFullScreen = false, isLoading = false }: HistoryViewportProps) => {
+const HistoryViewport = React.memo(({ messages, isFullScreen = false, isLoading = false }: HistoryViewportProps) => {
     const listRef = useRef<VirtualizedListRef<Message>>(null);
     const containerRef = useRef<DOMElement>(null);
 
     const { width } = useWindowSize();
-
-    // [FIX] Safe width to prevent wrapping with terminal scrollbar
     const safeWidth = Math.max(20, width - 5);
 
     // Initial estimation callback for VirtualizedList
@@ -41,23 +37,25 @@ export const HistoryViewport = React.memo(({ messages, isFullScreen = false, isL
 
     const keyExtractor = useCallback((item: Message) => item.id, []);
 
-    // [FIX TYPE ERROR] Destructure { item } from the arguments object
     const renderItem = useCallback(({ item }: { item: Message }) => (
         <Box paddingBottom={1} width={safeWidth}>
             <MessageItem msg={item} />
         </Box>
     ), [safeWidth]);
 
-    // --- NORMAL MODE: Static + Active Message ---
+    // --- NORMAL MODE: Smart Static Splitting ---
+    // Logikanya: Pesan lama masuk <Static> (Frozen, performa tinggi).
+    // Pesan terakhir (yang lagi ngetik/loading) masuk render biasa biar animasinya jalan.
     if (!isFullScreen) {
         let completedMessages: Message[] = [];
         let activeMessages: Message[] = [];
 
         if (isLoading && messages.length > 0) {
+            // Kalau lagi loading, pesan terakhir pasti lagi update. Jangan dibekukan.
             completedMessages = messages.slice(0, -1);
             activeMessages = [messages[messages.length - 1]];
         } else {
-            // Idle: Everything is committed to Static.
+            // Kalau idle, semua pesan sudah final. Bekukan semua.
             completedMessages = messages;
             activeMessages = [];
         }
@@ -66,17 +64,17 @@ export const HistoryViewport = React.memo(({ messages, isFullScreen = false, isL
             <Box flexDirection="column" width={safeWidth}>
                 {completedMessages.length > 0 && (
                     <Static items={completedMessages}>
-                        {(msg) => (
-                            <Box key={msg.id} paddingBottom={1} width={safeWidth}>
+                        {(msg, index) => (
+                            <Box key={msg.id || index} paddingBottom={1} width={safeWidth}>
                                 <MessageItem msg={msg} />
                             </Box>
                         )}
                     </Static>
                 )}
-                {activeMessages.map((msg) => (
-                    // [FIX] HAPUS paddingBottom={1} DI SINI!
-                    // Pesan aktif tidak boleh punya padding bawah berlebih agar cursor Ink stabil.
-                    <Box key={msg.id} width={safeWidth}>
+
+                {/* Active Message Area (Streaming) */}
+                {activeMessages.map((msg, index) => (
+                    <Box key={msg.id || 'active'} width={safeWidth}>
                         <MessageItem msg={msg} />
                     </Box>
                 ))}
@@ -99,3 +97,5 @@ export const HistoryViewport = React.memo(({ messages, isFullScreen = false, isL
         </Box>
     );
 });
+
+export default HistoryViewport; // [FIX] Default Export

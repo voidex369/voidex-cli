@@ -11,6 +11,9 @@ export interface PendingToolCall {
     tool_call_id: string;
     name: string;
     arguments: any;
+    // [BARU] Sistem Klasifikasi Risiko
+    riskLevel?: 'safe' | 'caution' | 'critical';
+    challengeCode?: string;
 }
 
 export interface AgentConfig {

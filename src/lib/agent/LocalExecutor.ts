@@ -1,6 +1,6 @@
 import { Message, PendingToolCall } from '../../types/index.js';
 import { createClient } from '../openrouter.js';
-import { toolsDefinition, toolRegistry, killActiveProcess } from '../tools.js';
+import { toolsDefinition, toolRegistry } from '../tools.js';
 import { getSystemContext } from '../context.js';
 import { truncateForRAM, pruneHistoryByChars } from '../../utils/memory.js';
 
@@ -27,6 +27,56 @@ export class LocalExecutor {
 
     constructor() { }
 
+    // [BARU] RISK ANALYZER ENGINE v3 (RECON FRIENDLY) 🧠
+    private analyzeRisk(toolName: string, args: any): { level: 'safe' | 'caution' | 'critical', reason?: string } {
+        // 1. CEK SHELL COMMAND
+        if (toolName === 'run_shell_command' || toolName === 'execute_bash') {
+            const cmd = (args.command || '').trim();
+
+            // --- A. CRITICAL (NUCLEAR TIER) - Butuh Kode Verifikasi ---
+            // Hanya untuk perintah yang MEMATIKAN SISTEM atau HAPUS MASSAL.
+            if (/(^|\s)rm\s+(-[a-zA-Z]*r[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*)\s+/.test(cmd)) return { level: 'critical', reason: 'Force Delete (rm -rf)' };
+            if (/(^|\s)mkfs/.test(cmd)) return { level: 'critical', reason: 'Format Disk' };
+            if (/(^|\s)dd\s+/.test(cmd)) return { level: 'critical', reason: 'Low-level Disk Write' };
+            if (/(^|\s):(){:|:&};:/.test(cmd)) return { level: 'critical', reason: 'Fork Bomb Detected' };
+            if (/(^|\s)(shutdown|reboot|init\s+0|init\s+6)/.test(cmd)) return { level: 'critical', reason: 'System Power Control' };
+
+            // --- B. CAUTION (MODERATE TIER) - Butuh Y/N ---
+            // Root access & System modification.
+            if (/(^|\s)sudo\s+/.test(cmd)) return { level: 'caution', reason: 'Root Access (sudo)' };
+            if (/(^|\s)(chmod|chown)\s+/.test(cmd)) return { level: 'caution', reason: 'Permission Modification' };
+
+            // Cek Redirection (>) yang BERBAHAYA
+            // Abaikan jika ke /dev/null, /tmp/, atau stdout/stderr (&1, &2)
+            // Regex logic: Ada tanda > TAPI BUKAN (> /dev/null, > /tmp/, 2>&1, 1>&2)
+            const isRedirection = />/.test(cmd);
+            const isSafeRedirection = />\s*(\/dev\/null|\/tmp\/|&1|&2)/.test(cmd) || /2>&1/.test(cmd);
+
+            if (isRedirection && !isSafeRedirection) {
+                return { level: 'caution', reason: 'File Overwrite' };
+            }
+
+            // --- C. SAFE (GREEN TIER) - Langsung Jalan ---
+            // Recon tools (curl, wget, nmap, ping, dig) umumnya aman SELAMA outputnya ke stdout atau /tmp/
+            // Kita sudah filter redirection bahaya di atas, jadi sisanya dianggap aman.
+            return { level: 'safe' };
+        }
+
+        // 2. CEK FILE SYSTEM TOOLS (Node.js API)
+        const FILE_MOD_TOOLS = ['write_file', 'writeFile', 'replace'];
+        if (FILE_MOD_TOOLS.includes(toolName)) {
+            return { level: 'caution', reason: 'Modify File Content' };
+        }
+
+        // 3. CEK DELEGASI AGENT
+        if (toolName === 'delegate_to_agent') {
+            return { level: 'caution', reason: 'Sub-Agent Delegation' };
+        }
+
+        // Sisanya (read_file, search, dll) dianggap SAFE
+        return { level: 'safe' };
+    }
+
     async run(params: ExecutorParams): Promise<void> {
         const { model, apiKey, messages, onUpdateMessages, onStatusUpdate, onLiveOutput, onNeedApproval, onError, signal } = params;
 
@@ -36,22 +86,19 @@ export class LocalExecutor {
         const currentAllowedTools = new Set(params.allowedTools || []);
         this.iterationCount = 0;
 
-        // Loop Detection Data
-        const toolPatterns = new Map<string, number>();
-
         while (state !== 'DONE' && state !== 'ERROR') {
             if (signal?.aborted) return;
 
             // Safety limit check
             if (this.iterationCount >= this.maxIterations) {
                 state = 'WAITING_APPROVAL';
-                // [FIX] Kirim status teks agar UI tidak mengunci ke Static
                 onStatusUpdate('Safety Limit Reached. Waiting approval...');
 
                 const approval = await onNeedApproval({
                     tool_call_id: 'sys-limit-' + Date.now(),
                     name: 'CONTINUE_LONG_TASK',
-                    arguments: { reason: `Safety limit (${this.maxIterations} steps) reached. Continue?` }
+                    arguments: { reason: `Safety limit (${this.maxIterations} steps) reached. Continue?` },
+                    riskLevel: 'caution'
                 });
 
                 if (approval === 'deny') {
@@ -60,7 +107,7 @@ export class LocalExecutor {
                     state = 'DONE';
                     continue;
                 } else {
-                    this.iterationCount = 0; // Reset
+                    this.iterationCount = 0;
                     state = 'THINKING';
                 }
             }
@@ -92,14 +139,7 @@ export class LocalExecutor {
                         tools: toolsDefinition as any,
                     }, { signal }), onStatusUpdate, signal);
 
-                    // -- Streaming Logic --
-                    let assistantMsg: Message = {
-                        id: 'assistant-' + Date.now(), // Stable ID
-                        role: 'assistant',
-                        content: '',
-                        tool_calls: []
-                    };
-
+                    let assistantMsg: Message = { id: 'assistant-' + Date.now(), role: 'assistant', content: '', tool_calls: [] };
                     let toolCallsBuffer: any[] = [];
                     let lastUpdate = 0;
                     let isAddedToHistory = false;
@@ -109,16 +149,12 @@ export class LocalExecutor {
                         const now = Date.now();
                         let hasChanges = false;
 
-                        // 1. Content Updates
                         if (delta?.content) {
                             assistantMsg.content = (assistantMsg.content || '') + delta.content;
-                            if (assistantMsg.content.length > 50000) {
-                                assistantMsg.content = truncateForRAM(assistantMsg.content);
-                            }
+                            if (assistantMsg.content.length > 50000) assistantMsg.content = truncateForRAM(assistantMsg.content);
                             hasChanges = true;
                         }
 
-                        // 2. Tool Call Updates
                         if (delta?.tool_calls) {
                             for (const tc of delta.tool_calls) {
                                 if (tc.index !== undefined) {
@@ -132,35 +168,27 @@ export class LocalExecutor {
                             hasChanges = true;
                         }
 
-                        // [FIX] THROTTLE 150ms untuk stabilitas terminal
                         if (hasChanges) {
                             if (!isAddedToHistory) {
                                 currentMessages.push(assistantMsg);
                                 isAddedToHistory = true;
                                 onUpdateMessages([...currentMessages]);
                                 lastUpdate = now;
-                            } else {
-                                if (now - lastUpdate > 150) {
-                                    currentMessages[currentMessages.length - 1] = { ...assistantMsg };
-                                    onUpdateMessages([...currentMessages]);
-                                    lastUpdate = now;
-                                }
+                            } else if (now - lastUpdate > 150) {
+                                currentMessages[currentMessages.length - 1] = { ...assistantMsg };
+                                onUpdateMessages([...currentMessages]);
+                                lastUpdate = now;
                             }
                         }
                     }
 
-                    // Final flush
                     if (isAddedToHistory) {
                         if (toolCallsBuffer.length > 0) assistantMsg.tool_calls = toolCallsBuffer;
                         currentMessages[currentMessages.length - 1] = { ...assistantMsg };
                         onUpdateMessages([...currentMessages]);
                     }
 
-                    if (toolCallsBuffer.length > 0) {
-                        state = 'EXECUTING_TOOLS';
-                    } else {
-                        state = 'DONE';
-                    }
+                    state = toolCallsBuffer.length > 0 ? 'EXECUTING_TOOLS' : 'DONE';
 
                 } catch (e: any) {
                     if (e.name === 'AbortError') return;
@@ -186,26 +214,33 @@ export class LocalExecutor {
                 let needsHeal = false;
                 let healPrompt = "";
 
-                const SENSITIVE_TOOLS = [
-                    'write_file', 'writeFile', 'replace', 'run_shell_command', 'execute_bash', 'google_web_search', 'delegate_to_agent'
-                ];
-
                 for (const tc of lastMsg.tool_calls) {
                     const toolName = tc.function.name;
                     let args: any = {};
-                    try {
-                        args = JSON.parse(tc.function.arguments || '{}');
-                    } catch (e) {
+                    try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {
                         toolMessages.push({ id: 'tool-err-' + Date.now(), role: 'tool', tool_call_id: tc.id, name: toolName, content: `[ERROR] Invalid JSON: ${tc.function.arguments}` });
                         continue;
                     }
 
-                    if (SENSITIVE_TOOLS.includes(toolName) && !currentAllowedTools.has(toolName)) {
-                        onStatusUpdate('Waiting for approval...');
+                    // [V3] Risk Analyzer
+                    const risk = this.analyzeRisk(toolName, args);
+
+                    // Needs Approval Logic
+                    const needsApproval = risk.level === 'critical' || (!currentAllowedTools.has(toolName) && risk.level !== 'safe');
+
+                    if (needsApproval) {
+                        onStatusUpdate('Security Check...');
+
+                        const challengeCode = risk.level === 'critical'
+                            ? Math.floor(1000 + Math.random() * 9000).toString()
+                            : undefined;
+
                         const decision = await onNeedApproval({
                             tool_call_id: tc.id,
                             name: toolName,
-                            arguments: args
+                            arguments: args,
+                            riskLevel: risk.level,
+                            challengeCode: challengeCode
                         });
 
                         if (decision === 'deny') {
@@ -213,7 +248,8 @@ export class LocalExecutor {
                             state = 'DONE';
                             break;
                         }
-                        if (decision === 'always') {
+
+                        if (decision === 'always' && risk.level !== 'critical') {
                             currentAllowedTools.add(toolName);
                             params.onToolWhitelisted?.(toolName);
                         }
@@ -225,10 +261,7 @@ export class LocalExecutor {
                         const toolFunc = toolRegistry[toolName as keyof typeof toolRegistry];
                         if (!toolFunc) throw new Error(`Tool ${toolName} not found`);
 
-                        const result = await toolFunc({
-                            ...args,
-                            onOutput: (chunk: string) => onLiveOutput(chunk)
-                        });
+                        const result = await toolFunc({ ...args, onOutput: (chunk: string) => onLiveOutput(chunk) });
 
                         onLiveOutput('');
                         toolMessages.push({
@@ -254,7 +287,6 @@ export class LocalExecutor {
                 if (state !== 'DONE') {
                     if (needsHeal) {
                         currentMessages.push({ id: 'heal-' + Date.now(), role: 'user', content: healPrompt });
-                        onUpdateMessages(currentMessages);
                         state = 'THINKING';
                     } else {
                         state = 'THINKING';
@@ -317,7 +349,7 @@ ${sysContext}
         } catch (err: any) {
             if (signal?.aborted) throw err;
             if ((err.message.includes('429') || err.message.includes('fetch failed')) && retries > 0) {
-                onStatus(`Connection unstable. Retrying in ${delay / 1000}s... (${retries} left)`);
+                onStatus(`Connection unstable. Retrying in ${delay / 1000}s...`);
                 await this.sleep(delay);
                 return this.callWithRetry(fn, onStatus, signal, retries - 1, delay * 2);
             }
